@@ -1,5 +1,6 @@
 pub mod committer;
 pub mod constraints;
+pub(crate) mod dft_layout;
 pub mod parameters;
 pub mod proof;
 pub mod prover;

@@ -24,6 +24,7 @@ use crate::{
             Constraint,
             statement::{SelectStatement, initial::InitialStatement},
         },
+        dft_layout::DftBatchLayout,
         proof::{QueryOpening, SumcheckData, WhirProof},
         utils::get_challenge_stir_queries,
     },
@@ -186,18 +187,23 @@ where
         // Compute the folding factors for later use
         let folding_factor_next = self.folding_factor.at_round(round_index + 1);
         let inv_rate = self.inv_rate(round_index);
+        let layout = DftBatchLayout::for_round(
+            folded_evaluations.num_variables(),
+            folding_factor_next,
+            inv_rate,
+        );
 
         // Transpose for reverse variable order
         // And then pad with zeros
         let padded = info_span!("transpose & pad").in_scope(|| {
-            let num_vars = folded_evaluations.num_variables();
             let mut mat = RowMajorMatrixView::new(
                 folded_evaluations.as_slice(),
-                1 << (num_vars - folding_factor_next),
+                layout.pre_transpose_width(),
             )
             .transpose();
 
-            mat.pad_to_height(inv_rate * (1 << (num_vars - folding_factor_next)), EF::ZERO);
+            debug_assert_eq!(mat.width(), layout.batch_count);
+            mat.pad_to_height(layout.padded_height, EF::ZERO);
             mat
         });
 

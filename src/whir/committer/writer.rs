@@ -15,7 +15,7 @@ use crate::{
     poly::multilinear::MultilinearPoint,
     whir::{
         committer::DenseMatrix, constraints::statement::initial::InitialStatement,
-        parameters::WhirConfig, proof::WhirProof,
+        dft_layout::DftBatchLayout, parameters::WhirConfig, proof::WhirProof,
     },
 };
 
@@ -80,16 +80,16 @@ where
         // And then pad with zeros
 
         let padded = info_span!("transpose & pad").in_scope(|| {
-            let num_vars = statement.num_variables();
-            let mut mat = RowMajorMatrixView::new(
-                statement.poly.as_slice(),
-                1 << (num_vars - self.folding_factor.at_round(0)),
-            )
-            .transpose();
-            mat.pad_to_height(
-                1 << (num_vars + self.starting_log_inv_rate - self.folding_factor.at_round(0)),
-                F::ZERO,
+            let layout = DftBatchLayout::for_commitment(
+                statement.num_variables(),
+                self.folding_factor.at_round(0),
+                self.starting_log_inv_rate,
             );
+            let mut mat =
+                RowMajorMatrixView::new(statement.poly.as_slice(), layout.pre_transpose_width())
+                    .transpose();
+            debug_assert_eq!(mat.width(), layout.batch_count);
+            mat.pad_to_height(layout.padded_height, F::ZERO);
             mat
         });
 
