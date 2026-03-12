@@ -14,24 +14,43 @@ use crate::whir::dft_layout::DftBatchLayout;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DftBackend {
     Cpu,
-    #[cfg(feature = "gpu-metal")]
+    #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
     Metal,
     #[cfg(feature = "gpu-vulkan")]
     Vulkan,
 }
 
 const fn selected_backend() -> DftBackend {
-    #[cfg(feature = "gpu-metal")]
+    #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
     {
         DftBackend::Metal
     }
-    #[cfg(all(not(feature = "gpu-metal"), feature = "gpu-vulkan"))]
+    #[cfg(all(
+        not(all(feature = "gpu-metal", target_os = "macos")),
+        feature = "gpu-vulkan"
+    ))]
     {
         DftBackend::Vulkan
     }
-    #[cfg(not(any(feature = "gpu-metal", feature = "gpu-vulkan")))]
+    #[cfg(not(any(
+        all(feature = "gpu-metal", target_os = "macos"),
+        feature = "gpu-vulkan"
+    )))]
     {
         DftBackend::Cpu
+    }
+}
+
+/// Returns the currently selected DFT backend.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) const fn selected_backend_name() -> &'static str {
+    match selected_backend() {
+        DftBackend::Cpu => "cpu",
+        #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+        DftBackend::Metal => "metal",
+        #[cfg(feature = "gpu-vulkan")]
+        DftBackend::Vulkan => "vulkan",
     }
 }
 
@@ -50,7 +69,7 @@ where
     debug_assert_eq!(padded.height(), layout.padded_height);
     match selected_backend() {
         DftBackend::Cpu => run_base_dft_cpu(dft, padded),
-        #[cfg(feature = "gpu-metal")]
+        #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
         DftBackend::Metal => run_base_dft_metal(dft, padded),
         #[cfg(feature = "gpu-vulkan")]
         DftBackend::Vulkan => run_base_dft_vulkan(dft, padded),
@@ -73,7 +92,7 @@ where
     debug_assert_eq!(padded.height(), layout.padded_height);
     match selected_backend() {
         DftBackend::Cpu => run_ext_dft_cpu(dft, padded),
-        #[cfg(feature = "gpu-metal")]
+        #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
         DftBackend::Metal => run_ext_dft_metal(dft, padded),
         #[cfg(feature = "gpu-vulkan")]
         DftBackend::Vulkan => run_ext_dft_vulkan(dft, padded),
@@ -99,7 +118,7 @@ where
     dft.dft_algebra_batch(padded).to_row_major_matrix()
 }
 
-#[cfg(feature = "gpu-metal")]
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
 #[inline]
 fn run_base_dft_metal<F, Dft>(dft: &Dft, padded: DenseMatrix<F>) -> DenseMatrix<F>
 where
@@ -110,7 +129,7 @@ where
     run_base_dft_cpu(dft, padded)
 }
 
-#[cfg(feature = "gpu-metal")]
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
 #[inline]
 fn run_ext_dft_metal<F, EF, Dft>(dft: &Dft, padded: DenseMatrix<EF>) -> DenseMatrix<EF>
 where
@@ -143,4 +162,15 @@ where
 {
     // Vulkan kernels are wired in a follow-up step.
     run_ext_dft_cpu(dft, padded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_backend_name;
+
+    #[test]
+    fn selected_backend_has_known_name() {
+        let name = selected_backend_name();
+        assert!(matches!(name, "cpu" | "metal" | "vulkan"));
+    }
 }
