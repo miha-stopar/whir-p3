@@ -15,7 +15,8 @@ use crate::{
     poly::multilinear::MultilinearPoint,
     whir::{
         committer::DenseMatrix, constraints::statement::initial::InitialStatement,
-        dft_layout::DftBatchLayout, parameters::WhirConfig, proof::WhirProof,
+        dft_backend::run_base_dft, dft_layout::DftBatchLayout, parameters::WhirConfig,
+        proof::WhirProof,
     },
 };
 
@@ -79,12 +80,13 @@ where
         // Transpose for reverse variable order
         // And then pad with zeros
 
+        let layout = DftBatchLayout::for_commitment(
+            statement.num_variables(),
+            self.folding_factor.at_round(0),
+            self.starting_log_inv_rate,
+        );
         let padded = info_span!("transpose & pad").in_scope(|| {
-            let layout = DftBatchLayout::for_commitment(
-                statement.num_variables(),
-                self.folding_factor.at_round(0),
-                self.starting_log_inv_rate,
-            );
+            debug_assert!(layout.padded_height.is_power_of_two());
             let mut mat =
                 RowMajorMatrixView::new(statement.poly.as_slice(), layout.pre_transpose_width())
                     .transpose();
@@ -95,7 +97,7 @@ where
 
         // Perform DFT on the padded evaluations matrix
         let folded_matrix = info_span!("dft", height = padded.height(), width = padded.width())
-            .in_scope(|| dft.dft_batch(padded).to_row_major_matrix());
+            .in_scope(|| run_base_dft(dft, padded, layout));
 
         // Commit to the Merkle tree (using P for leaves and PW for digest SIMD)
         let merkle_tree = MerkleTreeMmcs::<P, PW, H, C, DIGEST_ELEMS>::new(

@@ -24,6 +24,7 @@ use crate::{
             Constraint,
             statement::{SelectStatement, initial::InitialStatement},
         },
+        dft_backend::run_ext_dft,
         dft_layout::DftBatchLayout,
         proof::{QueryOpening, SumcheckData, WhirProof},
         utils::get_challenge_stir_queries,
@@ -196,6 +197,7 @@ where
         // Transpose for reverse variable order
         // And then pad with zeros
         let padded = info_span!("transpose & pad").in_scope(|| {
+            debug_assert!(layout.padded_height.is_power_of_two());
             let mut mat = RowMajorMatrixView::new(
                 folded_evaluations.as_slice(),
                 layout.pre_transpose_width(),
@@ -209,7 +211,7 @@ where
 
         // Perform DFT on the padded evaluations matrix
         let folded_matrix = info_span!("dft", height = padded.height(), width = padded.width())
-            .in_scope(|| dft.dft_algebra_batch(padded).to_row_major_matrix());
+            .in_scope(|| run_ext_dft(dft, padded, layout));
 
         let mmcs = MerkleTreeMmcs::<P, PW, H, C, DIGEST_ELEMS>::new(
             self.merkle_hash.clone(),
