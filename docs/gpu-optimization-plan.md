@@ -239,3 +239,20 @@ Success criteria:
 - Keep `CPU` as default backend until GPU passes correctness + benchmark gates.
 - Require deterministic behavior and stable transcript compatibility.
 - Add CI job running CPU and GPU parity tests on small/medium instances.
+
+## Current Implementation Status
+
+- DFT shape math is centralized in `src/whir/dft_layout.rs`.
+- Both DFT callsites (`commit` and prover rounds) route through backend hooks in
+  `src/whir/dft_backend.rs`.
+- Backend paths are split:
+  - `gpu-metal` feature for Metal path
+  - `gpu-vulkan` feature for Vulkan path
+- Current GPU paths are intentionally CPU fallbacks until kernels are implemented.
+
+Build matrix currently validated:
+
+- `cargo check`
+- `cargo check --features gpu-metal`
+- `cargo check --features gpu-vulkan`
+- `cargo check --features "gpu-metal,gpu-vulkan"`
