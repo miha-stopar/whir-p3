@@ -5,10 +5,7 @@ use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
 use p3_commit::{ExtensionMmcs, Mmcs};
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::{ExtensionField, Field, PackedValue, TwoAdicField};
-use p3_matrix::{
-    Matrix,
-    dense::{DenseMatrix, RowMajorMatrixView},
-};
+use p3_matrix::dense::DenseMatrix;
 use p3_merkle_tree::{MerkleTree, MerkleTreeMmcs};
 use p3_symmetric::{CryptographicHasher, Hash, PseudoCompressionFunction};
 use round_state::RoundState;
@@ -24,7 +21,7 @@ use crate::{
             Constraint,
             statement::{SelectStatement, initial::InitialStatement},
         },
-        dft_backend::run_ext_dft,
+        dft_backend::{run_ext_dft, selected_backend_name},
         dft_layout::DftBatchLayout,
         proof::{QueryOpening, SumcheckData, WhirProof},
         utils::get_challenge_stir_queries,
@@ -194,24 +191,14 @@ where
             inv_rate,
         );
 
-        // Transpose for reverse variable order
-        // And then pad with zeros
-        let padded = info_span!("transpose & pad").in_scope(|| {
-            debug_assert!(layout.padded_height.is_power_of_two());
-            let mut mat = RowMajorMatrixView::new(
-                folded_evaluations.as_slice(),
-                layout.pre_transpose_width(),
-            )
-            .transpose();
-
-            debug_assert_eq!(mat.width(), layout.batch_count);
-            mat.pad_to_height(layout.padded_height, EF::ZERO);
-            mat
-        });
-
-        // Perform DFT on the padded evaluations matrix
-        let folded_matrix = info_span!("dft", height = padded.height(), width = padded.width())
-            .in_scope(|| run_ext_dft(dft, padded, layout));
+        // Prepare (reshape/transpose/pad) + DFT using selected backend.
+        let folded_matrix = info_span!(
+            "dft",
+            backend = selected_backend_name(),
+            height = layout.padded_height,
+            width = layout.batch_count
+        )
+        .in_scope(|| run_ext_dft(dft, folded_evaluations.as_slice(), layout));
 
         let mmcs = MerkleTreeMmcs::<P, PW, H, C, DIGEST_ELEMS>::new(
             self.merkle_hash.clone(),

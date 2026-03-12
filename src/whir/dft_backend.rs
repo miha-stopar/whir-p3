@@ -5,8 +5,11 @@
 //! through a GPU hook that falls back to CPU until kernels are implemented.
 
 use p3_dft::TwoAdicSubgroupDft;
-use p3_field::{ExtensionField, TwoAdicField};
-use p3_matrix::{Matrix, dense::DenseMatrix};
+use p3_field::{ExtensionField, Field, TwoAdicField};
+use p3_matrix::{
+    Matrix,
+    dense::{DenseMatrix, RowMajorMatrixView},
+};
 
 use crate::whir::dft_layout::DftBatchLayout;
 
@@ -56,15 +59,12 @@ pub(crate) const fn selected_backend_name() -> &'static str {
 
 /// Execute batched DFT for base-field matrices.
 #[inline]
-pub(crate) fn run_base_dft<F, Dft>(
-    dft: &Dft,
-    padded: DenseMatrix<F>,
-    layout: DftBatchLayout,
-) -> DenseMatrix<F>
+pub(crate) fn run_base_dft<F, Dft>(dft: &Dft, evals: &[F], layout: DftBatchLayout) -> DenseMatrix<F>
 where
     F: TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
 {
+    let padded = reshape_transpose_pad(evals, layout);
     debug_assert_eq!(padded.width(), layout.batch_count);
     debug_assert_eq!(padded.height(), layout.padded_height);
     match selected_backend() {
@@ -80,7 +80,7 @@ where
 #[inline]
 pub(crate) fn run_ext_dft<F, EF, Dft>(
     dft: &Dft,
-    padded: DenseMatrix<EF>,
+    evals: &[EF],
     layout: DftBatchLayout,
 ) -> DenseMatrix<EF>
 where
@@ -88,6 +88,7 @@ where
     EF: ExtensionField<F> + TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
 {
+    let padded = reshape_transpose_pad(evals, layout);
     debug_assert_eq!(padded.width(), layout.batch_count);
     debug_assert_eq!(padded.height(), layout.padded_height);
     match selected_backend() {
@@ -97,6 +98,14 @@ where
         #[cfg(feature = "gpu-vulkan")]
         DftBackend::Vulkan => run_ext_dft_vulkan(dft, padded),
     }
+}
+
+#[inline]
+fn reshape_transpose_pad<T: Field>(evals: &[T], layout: DftBatchLayout) -> DenseMatrix<T> {
+    debug_assert_eq!(evals.len(), layout.batch_count * layout.base_height);
+    let mut matrix = RowMajorMatrixView::new(evals, layout.pre_transpose_width()).transpose();
+    matrix.pad_to_height(layout.padded_height, T::ZERO);
+    matrix.to_row_major_matrix()
 }
 
 #[inline]

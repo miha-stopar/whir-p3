@@ -4,7 +4,6 @@ use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
 use p3_commit::Mmcs;
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::{ExtensionField, Field, PackedValue, TwoAdicField};
-use p3_matrix::{Matrix, dense::RowMajorMatrixView};
 use p3_merkle_tree::{MerkleTree, MerkleTreeMmcs};
 use p3_symmetric::{CryptographicHasher, Hash, PseudoCompressionFunction};
 use serde::{Deserialize, Serialize};
@@ -14,8 +13,11 @@ use crate::{
     fiat_shamir::errors::FiatShamirError,
     poly::multilinear::MultilinearPoint,
     whir::{
-        committer::DenseMatrix, constraints::statement::initial::InitialStatement,
-        dft_backend::run_base_dft, dft_layout::DftBatchLayout, parameters::WhirConfig,
+        committer::DenseMatrix,
+        constraints::statement::initial::InitialStatement,
+        dft_backend::{run_base_dft, selected_backend_name},
+        dft_layout::DftBatchLayout,
+        parameters::WhirConfig,
         proof::WhirProof,
     },
 };
@@ -77,27 +79,19 @@ where
         Challenger: CanObserve<Hash<F, W, DIGEST_ELEMS>>,
         [W; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
     {
-        // Transpose for reverse variable order
-        // And then pad with zeros
-
         let layout = DftBatchLayout::for_commitment(
             statement.num_variables(),
             self.folding_factor.at_round(0),
             self.starting_log_inv_rate,
         );
-        let padded = info_span!("transpose & pad").in_scope(|| {
-            debug_assert!(layout.padded_height.is_power_of_two());
-            let mut mat =
-                RowMajorMatrixView::new(statement.poly.as_slice(), layout.pre_transpose_width())
-                    .transpose();
-            debug_assert_eq!(mat.width(), layout.batch_count);
-            mat.pad_to_height(layout.padded_height, F::ZERO);
-            mat
-        });
-
-        // Perform DFT on the padded evaluations matrix
-        let folded_matrix = info_span!("dft", height = padded.height(), width = padded.width())
-            .in_scope(|| run_base_dft(dft, padded, layout));
+        // Prepare (reshape/transpose/pad) + DFT using selected backend.
+        let folded_matrix = info_span!(
+            "dft",
+            backend = selected_backend_name(),
+            height = layout.padded_height,
+            width = layout.batch_count
+        )
+        .in_scope(|| run_base_dft(dft, statement.poly.as_slice(), layout));
 
         // Commit to the Merkle tree (using P for leaves and PW for digest SIMD)
         let merkle_tree = MerkleTreeMmcs::<P, PW, H, C, DIGEST_ELEMS>::new(
