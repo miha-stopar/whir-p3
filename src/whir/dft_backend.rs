@@ -13,6 +13,11 @@ use p3_matrix::{
 
 use crate::whir::dft_layout::DftBatchLayout;
 
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+mod metal;
+#[cfg(feature = "gpu-vulkan")]
+mod vulkan;
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DftBackend {
@@ -70,9 +75,9 @@ where
     match selected_backend() {
         DftBackend::Cpu => run_base_dft_cpu(dft, padded),
         #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
-        DftBackend::Metal => run_base_dft_metal(dft, padded),
+        DftBackend::Metal => metal::run_base_dft(dft, padded, layout),
         #[cfg(feature = "gpu-vulkan")]
-        DftBackend::Vulkan => run_base_dft_vulkan(dft, padded),
+        DftBackend::Vulkan => vulkan::run_base_dft(dft, padded, layout),
     }
 }
 
@@ -94,9 +99,9 @@ where
     match selected_backend() {
         DftBackend::Cpu => run_ext_dft_cpu(dft, padded),
         #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
-        DftBackend::Metal => run_ext_dft_metal(dft, padded),
+        DftBackend::Metal => metal::run_ext_dft(dft, padded, layout),
         #[cfg(feature = "gpu-vulkan")]
-        DftBackend::Vulkan => run_ext_dft_vulkan(dft, padded),
+        DftBackend::Vulkan => vulkan::run_ext_dft(dft, padded, layout),
     }
 }
 
@@ -109,7 +114,7 @@ fn reshape_transpose_pad<T: Field>(evals: &[T], layout: DftBatchLayout) -> Dense
 }
 
 #[inline]
-fn run_base_dft_cpu<F, Dft>(dft: &Dft, padded: DenseMatrix<F>) -> DenseMatrix<F>
+pub(super) fn run_base_dft_cpu<F, Dft>(dft: &Dft, padded: DenseMatrix<F>) -> DenseMatrix<F>
 where
     F: TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
@@ -118,59 +123,13 @@ where
 }
 
 #[inline]
-fn run_ext_dft_cpu<F, EF, Dft>(dft: &Dft, padded: DenseMatrix<EF>) -> DenseMatrix<EF>
+pub(super) fn run_ext_dft_cpu<F, EF, Dft>(dft: &Dft, padded: DenseMatrix<EF>) -> DenseMatrix<EF>
 where
     F: TwoAdicField,
     EF: ExtensionField<F> + TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
 {
     dft.dft_algebra_batch(padded).to_row_major_matrix()
-}
-
-#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
-#[inline]
-fn run_base_dft_metal<F, Dft>(dft: &Dft, padded: DenseMatrix<F>) -> DenseMatrix<F>
-where
-    F: TwoAdicField,
-    Dft: TwoAdicSubgroupDft<F>,
-{
-    // Metal kernels are wired in a follow-up step.
-    run_base_dft_cpu(dft, padded)
-}
-
-#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
-#[inline]
-fn run_ext_dft_metal<F, EF, Dft>(dft: &Dft, padded: DenseMatrix<EF>) -> DenseMatrix<EF>
-where
-    F: TwoAdicField,
-    EF: ExtensionField<F> + TwoAdicField,
-    Dft: TwoAdicSubgroupDft<F>,
-{
-    // Metal kernels are wired in a follow-up step.
-    run_ext_dft_cpu(dft, padded)
-}
-
-#[cfg(feature = "gpu-vulkan")]
-#[inline]
-fn run_base_dft_vulkan<F, Dft>(dft: &Dft, padded: DenseMatrix<F>) -> DenseMatrix<F>
-where
-    F: TwoAdicField,
-    Dft: TwoAdicSubgroupDft<F>,
-{
-    // Vulkan kernels are wired in a follow-up step.
-    run_base_dft_cpu(dft, padded)
-}
-
-#[cfg(feature = "gpu-vulkan")]
-#[inline]
-fn run_ext_dft_vulkan<F, EF, Dft>(dft: &Dft, padded: DenseMatrix<EF>) -> DenseMatrix<EF>
-where
-    F: TwoAdicField,
-    EF: ExtensionField<F> + TwoAdicField,
-    Dft: TwoAdicSubgroupDft<F>,
-{
-    // Vulkan kernels are wired in a follow-up step.
-    run_ext_dft_cpu(dft, padded)
 }
 
 #[cfg(test)]

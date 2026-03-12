@@ -245,6 +245,10 @@ Success criteria:
 - DFT shape math is centralized in `src/whir/dft_layout.rs`.
 - Both DFT callsites (`commit` and prover rounds) route through backend hooks in
   `src/whir/dft_backend.rs`.
+- Backend dispatch is now split into dedicated modules:
+  - `src/whir/dft_backend/metal.rs`
+  - `src/whir/dft_backend/vulkan.rs`
+  so kernel work can proceed independently per platform.
 - Backend paths are split:
   - `gpu-metal` feature for Metal path
   - `gpu-vulkan` feature for Vulkan path
