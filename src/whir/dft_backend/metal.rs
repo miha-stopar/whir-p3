@@ -142,9 +142,59 @@ enum MetalRuntimeStatus {
     Unavailable,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalPipelineState {
+    Compiled,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetalPipelineSet {
+    base_field_dft: MetalPipelineState,
+    extension_field_dft: MetalPipelineState,
+}
+
+impl MetalPipelineSet {
+    #[must_use]
+    const fn unavailable() -> Self {
+        Self {
+            base_field_dft: MetalPipelineState::Missing,
+            extension_field_dft: MetalPipelineState::Missing,
+        }
+    }
+
+    #[must_use]
+    const fn has_kernel(self, kernel: MetalKernel) -> bool {
+        match kernel {
+            MetalKernel::BaseFieldDft => {
+                matches!(self.base_field_dft, MetalPipelineState::Compiled)
+            }
+            MetalKernel::ExtensionFieldDft => {
+                matches!(self.extension_field_dft, MetalPipelineState::Compiled)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetalDeviceContext {
+    pipelines: MetalPipelineSet,
+}
+
+impl MetalDeviceContext {
+    #[must_use]
+    const fn unavailable() -> Self {
+        Self {
+            pipelines: MetalPipelineSet::unavailable(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MetalRuntime {
     status: MetalRuntimeStatus,
+    context: MetalDeviceContext,
 }
 
 impl MetalRuntime {
@@ -155,6 +205,7 @@ impl MetalRuntime {
             // Stub for the first real platform boundary. Device discovery and pipeline
             // creation will replace this fixed status.
             status: MetalRuntimeStatus::Unavailable,
+            context: MetalDeviceContext::unavailable(),
         }
     }
 
@@ -163,12 +214,18 @@ impl MetalRuntime {
     const fn detect() -> Self {
         Self {
             status: MetalRuntimeStatus::Unavailable,
+            context: MetalDeviceContext::unavailable(),
         }
     }
 
     #[must_use]
     const fn is_available(self) -> bool {
         matches!(self.status, MetalRuntimeStatus::Ready)
+    }
+
+    #[must_use]
+    const fn can_submit(self, kernel: MetalKernel) -> bool {
+        self.is_available() && self.context.pipelines.has_kernel(kernel)
     }
 }
 
@@ -188,7 +245,7 @@ where
     debug_assert!(submission.is_valid());
     debug_assert!(host_buffers.input_bytes > 0);
     debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
-    if runtime.is_available() {
+    if runtime.can_submit(submission.plan.kernel) {
         return submit_base_to_metal_runtime(dft, padded, submission, host_buffers, runtime);
     }
     // Placeholder for future Metal upload/dispatch/readback sequence.
@@ -212,7 +269,7 @@ where
     debug_assert!(submission.is_valid());
     debug_assert!(host_buffers.input_bytes > 0);
     debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
-    if runtime.is_available() {
+    if runtime.can_submit(submission.plan.kernel) {
         return submit_ext_to_metal_runtime(dft, padded, submission, host_buffers, runtime);
     }
     // Placeholder for future Metal upload/dispatch/readback sequence.
@@ -231,7 +288,7 @@ where
     F: TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
 {
-    debug_assert!(runtime.is_available());
+    debug_assert!(runtime.can_submit(submission.plan.kernel));
     debug_assert_eq!(submission.plan.kernel, MetalKernel::BaseFieldDft);
     debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
     // Placeholder for a real Metal submission path.
@@ -251,7 +308,7 @@ where
     EF: ExtensionField<F> + TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
 {
-    debug_assert!(runtime.is_available());
+    debug_assert!(runtime.can_submit(submission.plan.kernel));
     debug_assert_eq!(submission.plan.kernel, MetalKernel::ExtensionFieldDft);
     debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
     // Placeholder for a real Metal submission path.
@@ -320,8 +377,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MetalBufferLayout, MetalDispatch, MetalExecutionPlan, MetalHostBufferView, MetalKernel,
-        MetalRuntime, MetalRuntimeStatus, MetalSubmission, THREADS_PER_THREADGROUP,
+        MetalBufferLayout, MetalDeviceContext, MetalDispatch, MetalExecutionPlan,
+        MetalHostBufferView, MetalKernel, MetalPipelineSet, MetalPipelineState, MetalRuntime,
+        MetalRuntimeStatus, MetalSubmission, THREADS_PER_THREADGROUP,
     };
     use crate::whir::dft_backend::{DftElementKind, GpuDftJob};
     use crate::whir::dft_layout::DftBatchLayout;
@@ -389,5 +447,16 @@ mod tests {
         let runtime = MetalRuntime::detect();
         assert_eq!(runtime.status, MetalRuntimeStatus::Unavailable);
         assert!(!runtime.is_available());
+        assert_eq!(runtime.context, MetalDeviceContext::unavailable());
+        assert!(!runtime.can_submit(MetalKernel::BaseFieldDft));
+    }
+
+    #[test]
+    fn metal_pipeline_set_reports_missing_kernels() {
+        let pipelines = MetalPipelineSet::unavailable();
+        assert_eq!(pipelines.base_field_dft, MetalPipelineState::Missing);
+        assert_eq!(pipelines.extension_field_dft, MetalPipelineState::Missing);
+        assert!(!pipelines.has_kernel(MetalKernel::BaseFieldDft));
+        assert!(!pipelines.has_kernel(MetalKernel::ExtensionFieldDft));
     }
 }
