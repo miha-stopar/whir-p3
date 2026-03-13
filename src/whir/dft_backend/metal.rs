@@ -1,3 +1,5 @@
+use core::mem::size_of;
+
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::{ExtensionField, TwoAdicField};
 use p3_matrix::dense::DenseMatrix;
@@ -107,6 +109,32 @@ impl MetalSubmission {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetalHostBufferView {
+    input_bytes: usize,
+    output_bytes: usize,
+    scratch_bytes: usize,
+    twiddle_bytes: usize,
+}
+
+impl MetalHostBufferView {
+    #[must_use]
+    const fn from_submission<T>(submission: MetalSubmission) -> Self {
+        let element_bytes = size_of::<T>();
+        Self {
+            input_bytes: submission.buffers.input_elements * element_bytes,
+            output_bytes: submission.buffers.output_elements * element_bytes,
+            scratch_bytes: submission.buffers.scratch_elements * element_bytes,
+            twiddle_bytes: submission.buffers.twiddle_elements * element_bytes,
+        }
+    }
+
+    #[must_use]
+    const fn total_bytes(self) -> usize {
+        self.input_bytes + self.output_bytes + self.scratch_bytes + self.twiddle_bytes
+    }
+}
+
 #[inline]
 fn execute_base_submission<F, Dft>(
     dft: &Dft,
@@ -117,8 +145,11 @@ where
     F: TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
 {
+    let host_buffers = MetalHostBufferView::from_submission::<F>(submission);
     debug_assert_eq!(submission.plan.kernel, MetalKernel::BaseFieldDft);
     debug_assert!(submission.is_valid());
+    debug_assert!(host_buffers.input_bytes > 0);
+    debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
     // Placeholder for future Metal upload/dispatch/readback sequence.
     run_base_dft_cpu(dft, padded)
 }
@@ -134,8 +165,11 @@ where
     EF: ExtensionField<F> + TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
 {
+    let host_buffers = MetalHostBufferView::from_submission::<EF>(submission);
     debug_assert_eq!(submission.plan.kernel, MetalKernel::ExtensionFieldDft);
     debug_assert!(submission.is_valid());
+    debug_assert!(host_buffers.input_bytes > 0);
+    debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
     // Placeholder for future Metal upload/dispatch/readback sequence.
     run_ext_dft_cpu(dft, padded)
 }
@@ -202,8 +236,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MetalBufferLayout, MetalDispatch, MetalExecutionPlan, MetalKernel, MetalSubmission,
-        THREADS_PER_THREADGROUP,
+        MetalBufferLayout, MetalDispatch, MetalExecutionPlan, MetalHostBufferView, MetalKernel,
+        MetalSubmission, THREADS_PER_THREADGROUP,
     };
     use crate::whir::dft_backend::{DftElementKind, GpuDftJob};
     use crate::whir::dft_layout::DftBatchLayout;
@@ -247,6 +281,22 @@ mod tests {
                 scratch_elements: 16 * (1 << 21),
                 twiddle_elements: 1 << 20,
             }
+        );
+    }
+
+    #[test]
+    fn metal_host_buffer_view_tracks_byte_sizes() {
+        let layout = DftBatchLayout::for_commitment(24, 4, 1);
+        let job = GpuDftJob::from_layout(DftElementKind::BaseField, layout);
+        let submission = MetalSubmission::from_job(job);
+        let buffers = MetalHostBufferView::from_submission::<u32>(submission);
+        assert_eq!(buffers.input_bytes, 16 * (1 << 21) * size_of::<u32>());
+        assert_eq!(buffers.output_bytes, 16 * (1 << 21) * size_of::<u32>());
+        assert_eq!(buffers.scratch_bytes, 16 * (1 << 21) * size_of::<u32>());
+        assert_eq!(buffers.twiddle_bytes, (1 << 20) * size_of::<u32>());
+        assert_eq!(
+            buffers.total_bytes(),
+            ((16 * (1 << 21) * 3) + (1 << 20)) * size_of::<u32>()
         );
     }
 }
