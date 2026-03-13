@@ -249,6 +249,11 @@ Success criteria:
   - `src/whir/dft_backend/metal.rs`
   - `src/whir/dft_backend/vulkan.rs`
   so kernel work can proceed independently per platform.
+- Both GPU backends now derive dispatch geometry from a shared `GpuDftJob`
+  contract in `src/whir/dft_backend.rs`:
+  - `batch_count` = number of FFT streams
+  - `fft_size` = padded height per stream
+  - `element_count` = total matrix elements uploaded to the device
 - Backend paths are split:
   - `gpu-metal` feature for Metal path
   - `gpu-vulkan` feature for Vulkan path

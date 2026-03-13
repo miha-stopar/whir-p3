@@ -2,8 +2,29 @@ use p3_dft::TwoAdicSubgroupDft;
 use p3_field::{ExtensionField, TwoAdicField};
 use p3_matrix::dense::DenseMatrix;
 
-use super::{run_base_dft_cpu, run_ext_dft_cpu};
-use crate::whir::dft_layout::DftBatchLayout;
+use super::{DftElementKind, GpuDftJob, run_base_dft_cpu, run_ext_dft_cpu};
+
+const THREADS_PER_THREADGROUP: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetalDispatch {
+    threads_per_threadgroup: usize,
+    threadgroups_per_grid_x: usize,
+    threadgroups_per_grid_y: usize,
+}
+
+impl MetalDispatch {
+    #[must_use]
+    const fn from_job(job: GpuDftJob) -> Self {
+        let threadgroups_per_grid_x = job.fft_size.div_ceil(THREADS_PER_THREADGROUP);
+        let threadgroups_per_grid_y = job.batch_count;
+        Self {
+            threads_per_threadgroup: THREADS_PER_THREADGROUP,
+            threadgroups_per_grid_x,
+            threadgroups_per_grid_y,
+        }
+    }
+}
 
 /// Metal backend entrypoint.
 ///
@@ -13,12 +34,15 @@ use crate::whir::dft_layout::DftBatchLayout;
 pub(super) fn run_base_dft<F, Dft>(
     dft: &Dft,
     padded: DenseMatrix<F>,
-    _layout: DftBatchLayout,
+    job: GpuDftJob,
 ) -> DenseMatrix<F>
 where
     F: TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
 {
+    let dispatch = MetalDispatch::from_job(job);
+    debug_assert_eq!(job.element_kind, DftElementKind::BaseField);
+    debug_assert_eq!(dispatch.threadgroups_per_grid_y, job.batch_count);
     run_base_dft_cpu(dft, padded)
 }
 
@@ -30,12 +54,35 @@ where
 pub(super) fn run_ext_dft<F, EF, Dft>(
     dft: &Dft,
     padded: DenseMatrix<EF>,
-    _layout: DftBatchLayout,
+    job: GpuDftJob,
 ) -> DenseMatrix<EF>
 where
     F: TwoAdicField,
     EF: ExtensionField<F> + TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
 {
+    let dispatch = MetalDispatch::from_job(job);
+    debug_assert_eq!(job.element_kind, DftElementKind::ExtensionField);
+    debug_assert_eq!(dispatch.threadgroups_per_grid_y, job.batch_count);
     run_ext_dft_cpu(dft, padded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MetalDispatch, THREADS_PER_THREADGROUP};
+    use crate::whir::dft_backend::{DftElementKind, GpuDftJob};
+    use crate::whir::dft_layout::DftBatchLayout;
+
+    #[test]
+    fn metal_dispatch_matches_commitment_shape() {
+        let layout = DftBatchLayout::for_commitment(24, 4, 1);
+        let job = GpuDftJob::from_layout(DftElementKind::BaseField, layout);
+        let dispatch = MetalDispatch::from_job(job);
+        assert_eq!(dispatch.threads_per_threadgroup, THREADS_PER_THREADGROUP);
+        assert_eq!(
+            dispatch.threadgroups_per_grid_x,
+            (1 << 21) / THREADS_PER_THREADGROUP
+        );
+        assert_eq!(dispatch.threadgroups_per_grid_y, 16);
+    }
 }
