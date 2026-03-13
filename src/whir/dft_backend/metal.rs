@@ -1,7 +1,7 @@
 use core::mem::size_of;
 
 #[cfg(target_os = "macos")]
-use metal::{CompileOptions, Device};
+use metal::{CompileOptions, Device, MTLResourceOptions};
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::{ExtensionField, TwoAdicField};
 use p3_matrix::dense::DenseMatrix;
@@ -149,6 +149,15 @@ impl MetalHostBufferView {
     const fn total_bytes(self) -> usize {
         self.input_bytes + self.output_bytes + self.scratch_bytes + self.twiddle_bytes
     }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetalPreparedSubmission {
+    input_bytes: u64,
+    output_bytes: u64,
+    scratch_bytes: u64,
+    twiddle_bytes: u64,
 }
 
 #[allow(dead_code)]
@@ -388,6 +397,12 @@ where
     debug_assert!(runtime.can_submit(submission.plan.kernel));
     debug_assert_eq!(submission.plan.kernel, MetalKernel::BaseFieldDft);
     debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
+    #[cfg(target_os = "macos")]
+    {
+        let prepared = prepare_metal_submission(host_buffers)
+            .expect("metal runtime should prepare buffers after successful discovery");
+        debug_assert_eq!(prepared.input_bytes, host_buffers.input_bytes as u64);
+    }
     // Placeholder for a real Metal submission path.
     run_base_dft_cpu(dft, padded)
 }
@@ -408,8 +423,43 @@ where
     debug_assert!(runtime.can_submit(submission.plan.kernel));
     debug_assert_eq!(submission.plan.kernel, MetalKernel::ExtensionFieldDft);
     debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
+    #[cfg(target_os = "macos")]
+    {
+        let prepared = prepare_metal_submission(host_buffers)
+            .expect("metal runtime should prepare buffers after successful discovery");
+        debug_assert_eq!(prepared.input_bytes, host_buffers.input_bytes as u64);
+    }
     // Placeholder for a real Metal submission path.
     run_ext_dft_cpu(dft, padded)
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_metal_submission(
+    host_buffers: MetalHostBufferView,
+) -> Result<MetalPreparedSubmission, MetalDiscoveryError> {
+    let device = Device::system_default().ok_or(MetalDiscoveryError::DeviceUnavailable)?;
+    let _queue = device.new_command_queue();
+    let options = MTLResourceOptions::StorageModeShared;
+
+    let input = device.new_buffer(host_buffers.input_bytes as u64, options);
+    let output = device.new_buffer(host_buffers.output_bytes as u64, options);
+    let scratch = device.new_buffer(host_buffers.scratch_bytes as u64, options);
+    let twiddles = device.new_buffer(host_buffers.twiddle_bytes as u64, options);
+
+    if input.length() != host_buffers.input_bytes as u64
+        || output.length() != host_buffers.output_bytes as u64
+        || scratch.length() != host_buffers.scratch_bytes as u64
+        || twiddles.length() != host_buffers.twiddle_bytes as u64
+    {
+        return Err(MetalDiscoveryError::DeviceUnavailable);
+    }
+
+    Ok(MetalPreparedSubmission {
+        input_bytes: input.length(),
+        output_bytes: output.length(),
+        scratch_bytes: scratch.length(),
+        twiddle_bytes: twiddles.length(),
+    })
 }
 
 /// Metal backend entrypoint.
@@ -650,5 +700,19 @@ mod tests {
             context.pipelines.extension_field_dft,
             MetalPipelineState::Compiled
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepare_metal_submission_allocates_expected_buffer_sizes() {
+        let layout = DftBatchLayout::for_commitment(24, 4, 1);
+        let job = GpuDftJob::from_layout(DftElementKind::BaseField, layout);
+        let submission = MetalSubmission::from_job(job);
+        let host_buffers = MetalHostBufferView::from_submission::<u32>(submission);
+        let prepared = super::prepare_metal_submission(host_buffers).unwrap();
+        assert_eq!(prepared.input_bytes, host_buffers.input_bytes as u64);
+        assert_eq!(prepared.output_bytes, host_buffers.output_bytes as u64);
+        assert_eq!(prepared.scratch_bytes, host_buffers.scratch_bytes as u64);
+        assert_eq!(prepared.twiddle_bytes, host_buffers.twiddle_bytes as u64);
     }
 }
