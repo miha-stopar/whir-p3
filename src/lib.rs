@@ -1,5 +1,7 @@
 #![no_std]
 extern crate alloc;
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+extern crate std;
 
 pub mod constant;
 pub mod fiat_shamir;

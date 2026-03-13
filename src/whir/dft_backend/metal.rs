@@ -1,5 +1,7 @@
 use core::mem::size_of;
 
+#[cfg(target_os = "macos")]
+use metal::{CompileOptions, Device};
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::{ExtensionField, TwoAdicField};
 use p3_matrix::dense::DenseMatrix;
@@ -7,6 +9,20 @@ use p3_matrix::dense::DenseMatrix;
 use super::{DftElementKind, GpuDftJob, run_base_dft_cpu, run_ext_dft_cpu};
 
 const THREADS_PER_THREADGROUP: usize = 256;
+
+#[cfg(target_os = "macos")]
+const METAL_DISCOVERY_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void base_field_dft_stub(uint gid [[thread_position_in_grid]]) {
+    (void)gid;
+}
+
+kernel void extension_field_dft_stub(uint gid [[thread_position_in_grid]]) {
+    (void)gid;
+}
+"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetalKernel {
@@ -268,8 +284,14 @@ struct SystemMetalApi;
 #[cfg(target_os = "macos")]
 impl MetalApi for SystemMetalApi {
     fn discover_context() -> MetalDiscoveryResult {
-        // Real device and pipeline discovery will land here.
-        Err(MetalDiscoveryError::DeviceUnavailable)
+        let device = Device::system_default().ok_or(MetalDiscoveryError::DeviceUnavailable)?;
+        compile_stub_pipeline_set(&device)?;
+        Ok(MetalDeviceContext {
+            pipelines: MetalPipelineSet {
+                base_field_dft: MetalPipelineState::Compiled,
+                extension_field_dft: MetalPipelineState::Compiled,
+            },
+        })
     }
 }
 
@@ -278,6 +300,30 @@ impl MetalApi for SystemMetalApi {
     fn discover_context() -> MetalDiscoveryResult {
         Err(MetalDiscoveryError::UnsupportedPlatform)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn compile_stub_pipeline_set(device: &Device) -> Result<(), MetalDiscoveryError> {
+    let options = CompileOptions::new();
+    let library = device
+        .new_library_with_source(METAL_DISCOVERY_SHADER, &options)
+        .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+
+    let base_function = library
+        .get_function("base_field_dft_stub", None)
+        .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+    device
+        .new_compute_pipeline_state_with_function(&base_function)
+        .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+
+    let ext_function = library
+        .get_function("extension_field_dft_stub", None)
+        .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+    device
+        .new_compute_pipeline_state_with_function(&ext_function)
+        .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+
+    Ok(())
 }
 
 #[inline]
@@ -593,5 +639,16 @@ mod tests {
         assert_eq!(runtime.status, MetalRuntimeStatus::Unavailable);
         assert!(!runtime.is_available());
         assert!(!runtime.can_submit(MetalKernel::BaseFieldDft));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_metal_api_discovers_compiled_stub_pipelines() {
+        let context = super::SystemMetalApi::discover_context().unwrap();
+        assert_eq!(context.pipelines.base_field_dft, MetalPipelineState::Compiled);
+        assert_eq!(
+            context.pipelines.extension_field_dft,
+            MetalPipelineState::Compiled
+        );
     }
 }
