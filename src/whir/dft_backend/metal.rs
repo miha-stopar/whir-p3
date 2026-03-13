@@ -135,6 +135,43 @@ impl MetalHostBufferView {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalRuntimeStatus {
+    Ready,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetalRuntime {
+    status: MetalRuntimeStatus,
+}
+
+impl MetalRuntime {
+    #[must_use]
+    #[cfg(target_os = "macos")]
+    const fn detect() -> Self {
+        Self {
+            // Stub for the first real platform boundary. Device discovery and pipeline
+            // creation will replace this fixed status.
+            status: MetalRuntimeStatus::Unavailable,
+        }
+    }
+
+    #[must_use]
+    #[cfg(not(target_os = "macos"))]
+    const fn detect() -> Self {
+        Self {
+            status: MetalRuntimeStatus::Unavailable,
+        }
+    }
+
+    #[must_use]
+    const fn is_available(self) -> bool {
+        matches!(self.status, MetalRuntimeStatus::Ready)
+    }
+}
+
 #[inline]
 fn execute_base_submission<F, Dft>(
     dft: &Dft,
@@ -146,10 +183,14 @@ where
     Dft: TwoAdicSubgroupDft<F>,
 {
     let host_buffers = MetalHostBufferView::from_submission::<F>(submission);
+    let runtime = MetalRuntime::detect();
     debug_assert_eq!(submission.plan.kernel, MetalKernel::BaseFieldDft);
     debug_assert!(submission.is_valid());
     debug_assert!(host_buffers.input_bytes > 0);
     debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
+    if runtime.is_available() {
+        return submit_base_to_metal_runtime(dft, padded, submission, host_buffers, runtime);
+    }
     // Placeholder for future Metal upload/dispatch/readback sequence.
     run_base_dft_cpu(dft, padded)
 }
@@ -166,11 +207,54 @@ where
     Dft: TwoAdicSubgroupDft<F>,
 {
     let host_buffers = MetalHostBufferView::from_submission::<EF>(submission);
+    let runtime = MetalRuntime::detect();
     debug_assert_eq!(submission.plan.kernel, MetalKernel::ExtensionFieldDft);
     debug_assert!(submission.is_valid());
     debug_assert!(host_buffers.input_bytes > 0);
     debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
+    if runtime.is_available() {
+        return submit_ext_to_metal_runtime(dft, padded, submission, host_buffers, runtime);
+    }
     // Placeholder for future Metal upload/dispatch/readback sequence.
+    run_ext_dft_cpu(dft, padded)
+}
+
+#[inline]
+fn submit_base_to_metal_runtime<F, Dft>(
+    dft: &Dft,
+    padded: DenseMatrix<F>,
+    submission: MetalSubmission,
+    host_buffers: MetalHostBufferView,
+    runtime: MetalRuntime,
+) -> DenseMatrix<F>
+where
+    F: TwoAdicField,
+    Dft: TwoAdicSubgroupDft<F>,
+{
+    debug_assert!(runtime.is_available());
+    debug_assert_eq!(submission.plan.kernel, MetalKernel::BaseFieldDft);
+    debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
+    // Placeholder for a real Metal submission path.
+    run_base_dft_cpu(dft, padded)
+}
+
+#[inline]
+fn submit_ext_to_metal_runtime<F, EF, Dft>(
+    dft: &Dft,
+    padded: DenseMatrix<EF>,
+    submission: MetalSubmission,
+    host_buffers: MetalHostBufferView,
+    runtime: MetalRuntime,
+) -> DenseMatrix<EF>
+where
+    F: TwoAdicField,
+    EF: ExtensionField<F> + TwoAdicField,
+    Dft: TwoAdicSubgroupDft<F>,
+{
+    debug_assert!(runtime.is_available());
+    debug_assert_eq!(submission.plan.kernel, MetalKernel::ExtensionFieldDft);
+    debug_assert!(host_buffers.total_bytes() >= host_buffers.input_bytes);
+    // Placeholder for a real Metal submission path.
     run_ext_dft_cpu(dft, padded)
 }
 
@@ -237,7 +321,7 @@ where
 mod tests {
     use super::{
         MetalBufferLayout, MetalDispatch, MetalExecutionPlan, MetalHostBufferView, MetalKernel,
-        MetalSubmission, THREADS_PER_THREADGROUP,
+        MetalRuntime, MetalRuntimeStatus, MetalSubmission, THREADS_PER_THREADGROUP,
     };
     use crate::whir::dft_backend::{DftElementKind, GpuDftJob};
     use crate::whir::dft_layout::DftBatchLayout;
@@ -298,5 +382,12 @@ mod tests {
             buffers.total_bytes(),
             ((16 * (1 << 21) * 3) + (1 << 20)) * size_of::<u32>()
         );
+    }
+
+    #[test]
+    fn metal_runtime_defaults_to_unavailable_in_stub() {
+        let runtime = MetalRuntime::detect();
+        assert_eq!(runtime.status, MetalRuntimeStatus::Unavailable);
+        assert!(!runtime.is_available());
     }
 }
