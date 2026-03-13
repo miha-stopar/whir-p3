@@ -199,23 +199,38 @@ struct MetalRuntime {
 
 impl MetalRuntime {
     #[must_use]
-    #[cfg(target_os = "macos")]
-    const fn detect() -> Self {
+    const fn unavailable() -> Self {
         Self {
-            // Stub for the first real platform boundary. Device discovery and pipeline
-            // creation will replace this fixed status.
             status: MetalRuntimeStatus::Unavailable,
             context: MetalDeviceContext::unavailable(),
         }
     }
 
     #[must_use]
+    const fn from_context(context: MetalDeviceContext) -> Self {
+        let status = if context.pipelines.has_kernel(MetalKernel::BaseFieldDft)
+            && context.pipelines.has_kernel(MetalKernel::ExtensionFieldDft)
+        {
+            MetalRuntimeStatus::Ready
+        } else {
+            MetalRuntimeStatus::Unavailable
+        };
+        Self { status, context }
+    }
+
+    #[must_use]
+    #[cfg(target_os = "macos")]
+    fn detect() -> Self {
+        match discover_metal_context() {
+            Some(context) => Self::from_context(context),
+            None => Self::unavailable(),
+        }
+    }
+
+    #[must_use]
     #[cfg(not(target_os = "macos"))]
     const fn detect() -> Self {
-        Self {
-            status: MetalRuntimeStatus::Unavailable,
-            context: MetalDeviceContext::unavailable(),
-        }
+        Self::unavailable()
     }
 
     #[must_use]
@@ -227,6 +242,12 @@ impl MetalRuntime {
     const fn can_submit(self, kernel: MetalKernel) -> bool {
         self.is_available() && self.context.pipelines.has_kernel(kernel)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn discover_metal_context() -> Option<MetalDeviceContext> {
+    // Real device and pipeline discovery will land here.
+    None
 }
 
 #[inline]
@@ -458,5 +479,35 @@ mod tests {
         assert_eq!(pipelines.extension_field_dft, MetalPipelineState::Missing);
         assert!(!pipelines.has_kernel(MetalKernel::BaseFieldDft));
         assert!(!pipelines.has_kernel(MetalKernel::ExtensionFieldDft));
+    }
+
+    #[test]
+    fn metal_runtime_is_ready_when_both_kernels_exist() {
+        let context = MetalDeviceContext {
+            pipelines: MetalPipelineSet {
+                base_field_dft: MetalPipelineState::Compiled,
+                extension_field_dft: MetalPipelineState::Compiled,
+            },
+        };
+        let runtime = MetalRuntime::from_context(context);
+        assert_eq!(runtime.status, MetalRuntimeStatus::Ready);
+        assert!(runtime.is_available());
+        assert!(runtime.can_submit(MetalKernel::BaseFieldDft));
+        assert!(runtime.can_submit(MetalKernel::ExtensionFieldDft));
+    }
+
+    #[test]
+    fn metal_runtime_stays_unavailable_with_partial_pipeline_set() {
+        let context = MetalDeviceContext {
+            pipelines: MetalPipelineSet {
+                base_field_dft: MetalPipelineState::Compiled,
+                extension_field_dft: MetalPipelineState::Missing,
+            },
+        };
+        let runtime = MetalRuntime::from_context(context);
+        assert_eq!(runtime.status, MetalRuntimeStatus::Unavailable);
+        assert!(!runtime.is_available());
+        assert!(!runtime.can_submit(MetalKernel::BaseFieldDft));
+        assert!(!runtime.can_submit(MetalKernel::ExtensionFieldDft));
     }
 }
