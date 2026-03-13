@@ -221,16 +221,21 @@ impl MetalRuntime {
     #[must_use]
     #[cfg(target_os = "macos")]
     fn detect() -> Self {
-        match discover_metal_context() {
-            Some(context) => Self::from_context(context),
-            None => Self::unavailable(),
-        }
+        Self::detect_with::<SystemMetalApi>()
     }
 
     #[must_use]
     #[cfg(not(target_os = "macos"))]
     const fn detect() -> Self {
         Self::unavailable()
+    }
+
+    #[must_use]
+    fn detect_with<Api: MetalApi>() -> Self {
+        match Api::discover_context() {
+            Some(context) => Self::from_context(context),
+            None => Self::unavailable(),
+        }
     }
 
     #[must_use]
@@ -244,10 +249,25 @@ impl MetalRuntime {
     }
 }
 
+trait MetalApi {
+    fn discover_context() -> Option<MetalDeviceContext>;
+}
+
+struct SystemMetalApi;
+
 #[cfg(target_os = "macos")]
-fn discover_metal_context() -> Option<MetalDeviceContext> {
-    // Real device and pipeline discovery will land here.
-    None
+impl MetalApi for SystemMetalApi {
+    fn discover_context() -> Option<MetalDeviceContext> {
+        // Real device and pipeline discovery will land here.
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl MetalApi for SystemMetalApi {
+    fn discover_context() -> Option<MetalDeviceContext> {
+        None
+    }
 }
 
 #[inline]
@@ -398,7 +418,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MetalBufferLayout, MetalDeviceContext, MetalDispatch, MetalExecutionPlan,
+        MetalApi, MetalBufferLayout, MetalDeviceContext, MetalDispatch, MetalExecutionPlan,
         MetalHostBufferView, MetalKernel, MetalPipelineSet, MetalPipelineState, MetalRuntime,
         MetalRuntimeStatus, MetalSubmission, THREADS_PER_THREADGROUP,
     };
@@ -509,5 +529,43 @@ mod tests {
         assert!(!runtime.is_available());
         assert!(!runtime.can_submit(MetalKernel::BaseFieldDft));
         assert!(!runtime.can_submit(MetalKernel::ExtensionFieldDft));
+    }
+
+    struct ReadyMetalApi;
+
+    impl MetalApi for ReadyMetalApi {
+        fn discover_context() -> Option<MetalDeviceContext> {
+            Some(MetalDeviceContext {
+                pipelines: MetalPipelineSet {
+                    base_field_dft: MetalPipelineState::Compiled,
+                    extension_field_dft: MetalPipelineState::Compiled,
+                },
+            })
+        }
+    }
+
+    struct MissingMetalApi;
+
+    impl MetalApi for MissingMetalApi {
+        fn discover_context() -> Option<MetalDeviceContext> {
+            None
+        }
+    }
+
+    #[test]
+    fn metal_runtime_detect_with_ready_api_is_ready() {
+        let runtime = MetalRuntime::detect_with::<ReadyMetalApi>();
+        assert_eq!(runtime.status, MetalRuntimeStatus::Ready);
+        assert!(runtime.is_available());
+        assert!(runtime.can_submit(MetalKernel::BaseFieldDft));
+        assert!(runtime.can_submit(MetalKernel::ExtensionFieldDft));
+    }
+
+    #[test]
+    fn metal_runtime_detect_with_missing_api_is_unavailable() {
+        let runtime = MetalRuntime::detect_with::<MissingMetalApi>();
+        assert_eq!(runtime.status, MetalRuntimeStatus::Unavailable);
+        assert!(!runtime.is_available());
+        assert!(!runtime.can_submit(MetalKernel::BaseFieldDft));
     }
 }
