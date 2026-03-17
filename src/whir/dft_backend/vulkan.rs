@@ -1,10 +1,15 @@
 use p3_dft::TwoAdicSubgroupDft;
-use p3_field::{ExtensionField, TwoAdicField};
+use p3_field::TwoAdicField;
 use p3_matrix::dense::DenseMatrix;
 
-use super::{DftElementKind, GpuDftJob, run_base_dft_cpu, run_ext_dft_cpu};
+use super::{DftElementKind, GpuDftJob, run_base_dft_cpu};
 
 const LOCAL_SIZE_X: usize = 256;
+
+#[must_use]
+pub(super) const fn is_available() -> bool {
+    false
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VulkanDispatch {
@@ -44,27 +49,6 @@ where
     debug_assert_eq!(job.element_kind, DftElementKind::BaseField);
     debug_assert_eq!(dispatch.workgroups_y, job.batch_count);
     run_base_dft_cpu(dft, padded)
-}
-
-/// Vulkan extension-field backend entrypoint.
-///
-/// Separate hook because extension packing and kernel interfaces differ from
-/// base-field kernels.
-#[inline]
-pub(super) fn run_ext_dft<F, EF, Dft>(
-    dft: &Dft,
-    padded: DenseMatrix<EF>,
-    job: GpuDftJob,
-) -> DenseMatrix<EF>
-where
-    F: TwoAdicField,
-    EF: ExtensionField<F> + TwoAdicField,
-    Dft: TwoAdicSubgroupDft<F>,
-{
-    let dispatch = VulkanDispatch::from_job(job);
-    debug_assert_eq!(job.element_kind, DftElementKind::ExtensionField);
-    debug_assert_eq!(dispatch.workgroups_y, job.batch_count);
-    run_ext_dft_cpu(dft, padded)
 }
 
 #[cfg(test)]

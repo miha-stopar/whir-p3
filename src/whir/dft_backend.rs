@@ -9,6 +9,7 @@ use p3_field::{ExtensionField, Field, TwoAdicField};
 use p3_matrix::{
     Matrix,
     dense::{DenseMatrix, RowMajorMatrixView},
+    extension::FlatMatrixView,
 };
 
 use crate::whir::dft_layout::DftBatchLayout;
@@ -28,25 +29,19 @@ enum DftBackend {
     Vulkan,
 }
 
-const fn selected_backend() -> DftBackend {
+#[inline]
+fn selected_backend() -> DftBackend {
     #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
-    {
-        DftBackend::Metal
+    if metal::is_available() {
+        return DftBackend::Metal;
     }
-    #[cfg(all(
-        not(all(feature = "gpu-metal", target_os = "macos")),
-        feature = "gpu-vulkan"
-    ))]
-    {
-        DftBackend::Vulkan
+
+    #[cfg(feature = "gpu-vulkan")]
+    if vulkan::is_available() {
+        return DftBackend::Vulkan;
     }
-    #[cfg(not(any(
-        all(feature = "gpu-metal", target_os = "macos"),
-        feature = "gpu-vulkan"
-    )))]
-    {
-        DftBackend::Cpu
-    }
+
+    DftBackend::Cpu
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,12 +81,22 @@ impl GpuDftJob {
             && self.batch_count.is_power_of_two()
             && self.fft_size.is_power_of_two()
     }
+
+    #[must_use]
+    pub(super) const fn flattened_to_base(self, extension_degree: usize) -> Self {
+        Self {
+            element_kind: DftElementKind::BaseField,
+            batch_count: self.batch_count * extension_degree,
+            fft_size: self.fft_size,
+            element_count: self.element_count * extension_degree,
+        }
+    }
 }
 
 /// Returns the currently selected DFT backend.
 #[must_use]
 #[allow(dead_code)]
-pub(crate) const fn selected_backend_name() -> &'static str {
+pub(crate) fn selected_backend_name() -> &'static str {
     match selected_backend() {
         DftBackend::Cpu => "cpu",
         #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
@@ -135,17 +140,25 @@ where
     Dft: TwoAdicSubgroupDft<F>,
 {
     let job = GpuDftJob::from_layout(DftElementKind::ExtensionField, layout);
-    let padded = reshape_transpose_pad(evals, layout);
-    debug_assert_eq!(padded.width(), layout.batch_count);
-    debug_assert_eq!(padded.height(), layout.padded_height);
+    let base_job = job.flattened_to_base(EF::DIMENSION);
+    let base_padded = reshape_transpose_pad_ext_to_base(evals, layout);
+    debug_assert_eq!(base_padded.width(), layout.batch_count * EF::DIMENSION);
+    debug_assert_eq!(base_padded.height(), layout.padded_height);
     debug_assert!(job.is_valid());
-    match selected_backend() {
-        DftBackend::Cpu => run_ext_dft_cpu(dft, padded),
+    debug_assert!(base_job.is_valid());
+
+    let base_output = match selected_backend() {
+        DftBackend::Cpu => run_base_dft_cpu(dft, base_padded),
         #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
-        DftBackend::Metal => metal::run_ext_dft(dft, padded, job),
+        DftBackend::Metal => metal::run_base_dft(dft, base_padded, base_job),
         #[cfg(feature = "gpu-vulkan")]
-        DftBackend::Vulkan => vulkan::run_ext_dft(dft, padded, job),
-    }
+        DftBackend::Vulkan => vulkan::run_base_dft(dft, base_padded, base_job),
+    };
+
+    DenseMatrix::new(
+        EF::reconstitute_from_base(base_output.values),
+        layout.batch_count,
+    )
 }
 
 #[inline]
@@ -157,6 +170,20 @@ fn reshape_transpose_pad<T: Field>(evals: &[T], layout: DftBatchLayout) -> Dense
 }
 
 #[inline]
+fn reshape_transpose_pad_ext_to_base<F, EF>(evals: &[EF], layout: DftBatchLayout) -> DenseMatrix<F>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    debug_assert_eq!(evals.len(), layout.batch_count * layout.base_height);
+    let matrix = RowMajorMatrixView::new(evals, layout.pre_transpose_width()).transpose();
+    let mut flat = FlatMatrixView::<F, EF, _>::new(matrix).to_row_major_matrix();
+    debug_assert_eq!(flat.width(), layout.batch_count * EF::DIMENSION);
+    flat.pad_to_height(layout.padded_height, F::ZERO);
+    flat
+}
+
+#[inline]
 pub(super) fn run_base_dft_cpu<F, Dft>(dft: &Dft, padded: DenseMatrix<F>) -> DenseMatrix<F>
 where
     F: TwoAdicField,
@@ -165,6 +192,7 @@ where
     dft.dft_batch(padded).to_row_major_matrix()
 }
 
+#[cfg(test)]
 #[inline]
 pub(super) fn run_ext_dft_cpu<F, EF, Dft>(dft: &Dft, padded: DenseMatrix<EF>) -> DenseMatrix<EF>
 where
@@ -177,7 +205,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{DftElementKind, GpuDftJob, selected_backend_name};
+    use alloc::vec::Vec;
+
+    use p3_baby_bear::BabyBear;
+    use p3_dft::Radix2DFTSmallBatch;
+    use p3_field::{BasedVectorSpace, PrimeCharacteristicRing, extension::BinomialExtensionField};
+
+    use super::{
+        DftElementKind, GpuDftJob, reshape_transpose_pad, reshape_transpose_pad_ext_to_base,
+        run_ext_dft, run_ext_dft_cpu, selected_backend_name,
+    };
     use crate::whir::dft_layout::DftBatchLayout;
 
     #[test]
@@ -194,5 +231,50 @@ mod tests {
         assert_eq!(job.fft_size, 1 << 21);
         assert_eq!(job.element_count, 16 * (1 << 21));
         assert!(job.is_valid());
+    }
+
+    #[test]
+    fn extension_gpu_job_flattens_to_base_streams() {
+        let layout = DftBatchLayout::for_round(20, 4, 4);
+        let job = GpuDftJob::from_layout(DftElementKind::ExtensionField, layout);
+        let flattened = job.flattened_to_base(4);
+        assert_eq!(flattened.element_kind, DftElementKind::BaseField);
+        assert_eq!(flattened.batch_count, 64);
+        assert_eq!(flattened.fft_size, 1 << 18);
+        assert_eq!(flattened.element_count, 64 * (1 << 18));
+        assert!(flattened.is_valid());
+    }
+
+    #[test]
+    fn reshape_transpose_pad_ext_to_base_matches_flatten_after_padding() {
+        type F = BabyBear;
+        type EF = BinomialExtensionField<F, 4>;
+
+        let layout = DftBatchLayout::for_round(4, 2, 2);
+        let evals = (0_u32..16)
+            .map(|i| EF::from_basis_coefficients_fn(|j| F::from_u32(i * 4 + j as u32 + 1)))
+            .collect::<Vec<_>>();
+
+        let expected = reshape_transpose_pad(&evals, layout).flatten_to_base();
+        let actual = reshape_transpose_pad_ext_to_base::<F, EF>(&evals, layout);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ext_dft_matches_cpu_algebra_path() {
+        type F = BabyBear;
+        type EF = BinomialExtensionField<F, 4>;
+
+        let layout = DftBatchLayout::for_round(4, 2, 2);
+        let evals = (0_u32..16)
+            .map(|i| EF::from_basis_coefficients_fn(|j| F::from_u32(i * 4 + j as u32 + 1)))
+            .collect::<Vec<_>>();
+        let dft = Radix2DFTSmallBatch::<F>::default();
+
+        let expected = run_ext_dft_cpu(&dft, reshape_transpose_pad(&evals, layout));
+        let actual = run_ext_dft(&dft, &evals, layout);
+
+        assert_eq!(actual, expected);
     }
 }
