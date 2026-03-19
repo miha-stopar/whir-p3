@@ -118,13 +118,7 @@ where
     debug_assert_eq!(padded.width(), layout.batch_count);
     debug_assert_eq!(padded.height(), layout.padded_height);
     debug_assert!(job.is_valid());
-    match selected_backend() {
-        DftBackend::Cpu => run_base_dft_cpu(dft, padded),
-        #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
-        DftBackend::Metal => metal::run_base_dft(dft, padded, job),
-        #[cfg(feature = "gpu-vulkan")]
-        DftBackend::Vulkan => vulkan::run_base_dft(dft, padded, job),
-    }
+    run_padded_base_dft_with_selected_backend(dft, padded, job)
 }
 
 /// Execute batched DFT for extension-field matrices.
@@ -190,6 +184,63 @@ where
     Dft: TwoAdicSubgroupDft<F>,
 {
     dft.dft_batch(padded).to_row_major_matrix()
+}
+
+#[inline]
+fn run_padded_base_dft_with_selected_backend<F, Dft>(
+    dft: &Dft,
+    padded: DenseMatrix<F>,
+    _job: GpuDftJob,
+) -> DenseMatrix<F>
+where
+    F: TwoAdicField,
+    Dft: TwoAdicSubgroupDft<F>,
+{
+    match selected_backend() {
+        DftBackend::Cpu => run_base_dft_cpu(dft, padded),
+        #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+        DftBackend::Metal => metal::run_base_dft(dft, padded, _job),
+        #[cfg(feature = "gpu-vulkan")]
+        DftBackend::Vulkan => vulkan::run_base_dft(dft, padded, _job),
+    }
+}
+
+#[inline]
+pub(super) fn run_padded_base_dft_explicit_cpu<F, Dft>(
+    dft: &Dft,
+    padded: DenseMatrix<F>,
+) -> DenseMatrix<F>
+where
+    F: TwoAdicField,
+    Dft: TwoAdicSubgroupDft<F>,
+{
+    run_base_dft_cpu(dft, padded)
+}
+
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+#[inline]
+pub(super) fn run_padded_base_dft_explicit_metal<F, Dft>(
+    dft: &Dft,
+    padded: DenseMatrix<F>,
+) -> DenseMatrix<F>
+where
+    F: TwoAdicField,
+    Dft: TwoAdicSubgroupDft<F>,
+{
+    let job = GpuDftJob {
+        element_kind: DftElementKind::BaseField,
+        batch_count: padded.width(),
+        fft_size: padded.height(),
+        element_count: padded.width() * padded.height(),
+    };
+    debug_assert!(job.is_valid());
+    metal::run_base_dft(dft, padded, job)
+}
+
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+#[must_use]
+pub(super) fn metal_is_available_for_bench() -> bool {
+    metal::is_available()
 }
 
 #[cfg(test)]

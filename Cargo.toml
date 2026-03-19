@@ -120,3 +120,7 @@ harness = false
 [[bench]]
 name = "stir_queries"
 harness = false
+
+[[bench]]
+name = "dft"
+harness = false

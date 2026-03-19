@@ -2,13 +2,16 @@ use core::{any::TypeId, ffi::c_void, mem::size_of, slice};
 
 #[cfg(target_os = "macos")]
 use metal::{
-    CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
+    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions,
+    MTLSize, NSRange,
 };
 use p3_baby_bear::BabyBear;
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::{PrimeField32, TwoAdicField};
 use p3_koala_bear::KoalaBear;
-use p3_matrix::{Matrix, dense::DenseMatrix, util::reverse_matrix_index_bits};
+use p3_matrix::{Matrix, dense::DenseMatrix};
+#[cfg(all(target_os = "macos", test))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(target_os = "macos")]
 use std::{cell::RefCell, sync::OnceLock, thread_local, vec::Vec};
 
@@ -23,6 +26,9 @@ static METAL_RUNTIME: OnceLock<MetalRuntime> = OnceLock::new();
 thread_local! {
     static METAL_EXECUTOR: RefCell<Option<MetalExecutor>> = const { RefCell::new(None) };
 }
+
+#[cfg(all(target_os = "macos", test))]
+static METAL_GPU_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_os = "macos")]
 const METAL_DISCOVERY_SHADER: &str = r#"
@@ -104,10 +110,10 @@ struct MetalStageParams {
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct MetalPrimeFieldExecution {
+    kind: MetalPrimeFieldKind,
     width: usize,
+    fft_size: usize,
     modulus: u32,
-    input: Vec<u32>,
-    twiddles: Vec<u32>,
 }
 
 #[cfg(target_os = "macos")]
@@ -117,6 +123,37 @@ struct MetalExecutor {
     queue: CommandQueue,
     pipeline: ComputePipelineState,
     threads_per_threadgroup: usize,
+    resources: MetalResourceCache,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalPrimeFieldKind {
+    BabyBear,
+    KoalaBear,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetalTwiddleKey {
+    kind: MetalPrimeFieldKind,
+    fft_size: usize,
+    modulus: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+struct MetalTwiddleCacheEntry {
+    key: MetalTwiddleKey,
+    buffer: Buffer,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct MetalResourceCache {
+    input: Option<Buffer>,
+    scratch: Option<Buffer>,
+    twiddles: Vec<MetalTwiddleCacheEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +203,7 @@ impl MetalExecutionPlan {
             kernel,
             dispatch: MetalDispatch::from_job(job),
             stage_count: job.fft_size.trailing_zeros(),
-            twiddle_count: job.fft_size / 2,
+            twiddle_count: job.fft_size.saturating_sub(1),
             input_elements: job.element_count,
             // The first GPU implementation will use ping-pong buffers, so scratch
             // matches the uploaded matrix size.
@@ -236,13 +273,79 @@ impl MetalHostBufferView {
             input_bytes: submission.buffers.input_elements * element_bytes,
             output_bytes: submission.buffers.output_elements * element_bytes,
             scratch_bytes: submission.buffers.scratch_elements * element_bytes,
-            twiddle_bytes: submission.buffers.twiddle_elements * element_bytes,
+            twiddle_bytes: submission.buffers.twiddle_elements * size_of::<u32>(),
         }
     }
 
     #[must_use]
     const fn total_bytes(self) -> usize {
         self.input_bytes + self.output_bytes + self.scratch_bytes + self.twiddle_bytes
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MetalResourceCache {
+    fn ensure_reusable_buffer(
+        device: &Device,
+        slot: &mut Option<Buffer>,
+        min_bytes: u64,
+        options: MTLResourceOptions,
+    ) -> Result<Buffer, MetalDiscoveryError> {
+        let needs_allocation = slot
+            .as_ref()
+            .is_none_or(|buffer| buffer.length() < min_bytes);
+        if needs_allocation {
+            *slot = Some(device.new_buffer(min_bytes, options));
+        }
+
+        let Some(buffer) = slot.as_ref() else {
+            return Err(MetalDiscoveryError::DeviceUnavailable);
+        };
+        if buffer.length() < min_bytes {
+            return Err(MetalDiscoveryError::DeviceUnavailable);
+        }
+
+        Ok(buffer.clone())
+    }
+
+    fn execution_buffers(
+        &mut self,
+        device: &Device,
+        input_bytes: u64,
+        options: MTLResourceOptions,
+    ) -> Result<(Buffer, Buffer), MetalDiscoveryError> {
+        let input = Self::ensure_reusable_buffer(device, &mut self.input, input_bytes, options)?;
+        let scratch =
+            Self::ensure_reusable_buffer(device, &mut self.scratch, input_bytes, options)?;
+        Ok((input, scratch))
+    }
+
+    fn twiddle_buffer(
+        &mut self,
+        device: &Device,
+        key: MetalTwiddleKey,
+        options: MTLResourceOptions,
+    ) -> Result<Buffer, MetalDiscoveryError> {
+        if let Some(entry) = self.twiddles.iter().find(|entry| entry.key == key) {
+            return Ok(entry.buffer.clone());
+        }
+
+        let twiddles = stage_twiddles_for_kind(key.kind, key.fft_size);
+        let twiddle_len_bytes = (twiddles.len() * size_of::<u32>()) as u64;
+        let buffer = device.new_buffer_with_data(
+            twiddles.as_ptr().cast::<c_void>(),
+            twiddle_len_bytes,
+            options,
+        );
+        if buffer.length() != twiddle_len_bytes {
+            return Err(MetalDiscoveryError::DeviceUnavailable);
+        }
+
+        self.twiddles.push(MetalTwiddleCacheEntry {
+            key,
+            buffer: buffer.clone(),
+        });
+        Ok(buffer)
     }
 }
 
@@ -478,13 +581,14 @@ impl MetalExecutor {
             queue,
             pipeline,
             threads_per_threadgroup,
+            resources: MetalResourceCache::default(),
         })
     }
 }
 
 #[cfg(target_os = "macos")]
 fn with_metal_executor<R>(
-    f: impl FnOnce(&MetalExecutor) -> Result<R, MetalDiscoveryError>,
+    f: impl FnOnce(&mut MetalExecutor) -> Result<R, MetalDiscoveryError>,
 ) -> Result<R, MetalDiscoveryError> {
     METAL_EXECUTOR.with(|slot| {
         if slot.borrow().is_none() {
@@ -492,52 +596,49 @@ fn with_metal_executor<R>(
             *slot.borrow_mut() = Some(executor);
         }
 
-        let guard = slot.borrow();
-        let executor = guard.as_ref().expect("executor initialized");
+        let mut guard = slot.borrow_mut();
+        let executor = guard.as_mut().expect("executor initialized");
         f(executor)
     })
 }
 
 #[cfg(target_os = "macos")]
 fn execute_prime_field_fft(
-    executor: &MetalExecutor,
-    fft_size: usize,
+    executor: &mut MetalExecutor,
     execution: &MetalPrimeFieldExecution,
-) -> Result<Vec<u32>, MetalDiscoveryError> {
-    let buffer_len_bytes = (execution.input.len() * size_of::<u32>()) as u64;
-    let twiddle_len_bytes = (execution.twiddles.len() * size_of::<u32>()) as u64;
+    write_input: impl FnOnce(&Buffer),
+) -> Result<Buffer, MetalDiscoveryError> {
+    let input_len = execution.width * execution.fft_size;
+    let buffer_len_bytes = (input_len * size_of::<u32>()) as u64;
     let options = MTLResourceOptions::StorageModeShared;
+    let (input_buffer, scratch_buffer) =
+        executor
+            .resources
+            .execution_buffers(&executor.device, buffer_len_bytes, options)?;
+    let twiddle_key = MetalTwiddleKey {
+        kind: execution.kind,
+        fft_size: execution.fft_size,
+        modulus: execution.modulus,
+    };
+    let twiddle_buffer =
+        executor
+            .resources
+            .twiddle_buffer(&executor.device, twiddle_key, options)?;
 
-    let input_buffer = executor.device.new_buffer_with_data(
-        execution.input.as_ptr().cast::<c_void>(),
-        buffer_len_bytes,
-        options,
-    );
-    let scratch_buffer = executor.device.new_buffer(buffer_len_bytes, options);
-    let twiddle_buffer = executor.device.new_buffer_with_data(
-        execution.twiddles.as_ptr().cast::<c_void>(),
-        twiddle_len_bytes,
-        options,
-    );
-
-    if input_buffer.length() != buffer_len_bytes
-        || scratch_buffer.length() != buffer_len_bytes
-        || twiddle_buffer.length() != twiddle_len_bytes
-    {
-        return Err(MetalDiscoveryError::DeviceUnavailable);
-    }
+    write_input(&input_buffer);
+    input_buffer.did_modify_range(NSRange::new(0, buffer_len_bytes));
 
     let command_buffer = executor.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&executor.pipeline);
 
     let mut twiddle_offset = 0usize;
-    let mut src_buffer = &input_buffer;
-    let mut dst_buffer = &scratch_buffer;
-    let butterfly_count = execution.width * (fft_size / 2);
+    let mut src_buffer = input_buffer;
+    let mut dst_buffer = scratch_buffer;
+    let butterfly_count = execution.width * (execution.fft_size / 2);
     let threads_per_threadgroup = executor.threads_per_threadgroup.min(butterfly_count.max(1));
 
-    for stage in 0..fft_size.ilog2() as usize {
+    for stage in 0..execution.fft_size.ilog2() as usize {
         let half_size = 1usize << stage;
         let stage_params = MetalStageParams {
             width: execution.width as u32,
@@ -546,8 +647,8 @@ fn execute_prime_field_fft(
             modulus: execution.modulus,
         };
 
-        encoder.set_buffer(0, Some(src_buffer), 0);
-        encoder.set_buffer(1, Some(dst_buffer), 0);
+        encoder.set_buffer(0, Some(&src_buffer), 0);
+        encoder.set_buffer(1, Some(&dst_buffer), 0);
         encoder.set_buffer(
             2,
             Some(&twiddle_buffer),
@@ -578,10 +679,11 @@ fn execute_prime_field_fft(
     encoder.end_encoding();
     command_buffer.commit();
     command_buffer.wait_until_completed();
+    #[cfg(test)]
+    METAL_GPU_DISPATCHES.fetch_add(1, Ordering::Relaxed);
 
-    let output_ptr = src_buffer.contents().cast::<u32>();
-    let output = unsafe { slice::from_raw_parts(output_ptr, execution.input.len()) };
-    Ok(output.to_vec())
+    debug_assert_eq!(input_len, execution.width * execution.fft_size);
+    Ok(src_buffer)
 }
 
 #[cfg(target_os = "macos")]
@@ -590,18 +692,18 @@ where
     F: TwoAdicField,
 {
     if TypeId::of::<F>() == TypeId::of::<BabyBear>() {
-        let values = unsafe { cast_field_slice::<F, BabyBear>(&padded.values) };
+        let _ = unsafe { cast_field_slice::<F, BabyBear>(&padded.values) };
         return Some(build_prime_field_execution::<BabyBear>(
-            values,
+            MetalPrimeFieldKind::BabyBear,
             padded.width(),
             padded.height(),
         ));
     }
 
     if TypeId::of::<F>() == TypeId::of::<KoalaBear>() {
-        let values = unsafe { cast_field_slice::<F, KoalaBear>(&padded.values) };
+        let _ = unsafe { cast_field_slice::<F, KoalaBear>(&padded.values) };
         return Some(build_prime_field_execution::<KoalaBear>(
-            values,
+            MetalPrimeFieldKind::KoalaBear,
             padded.width(),
             padded.height(),
         ));
@@ -612,24 +714,18 @@ where
 
 #[cfg(target_os = "macos")]
 fn build_prime_field_execution<F>(
-    values: &[F],
+    kind: MetalPrimeFieldKind,
     width: usize,
     fft_size: usize,
 ) -> MetalPrimeFieldExecution
 where
     F: PrimeField32 + TwoAdicField,
 {
-    let mut input = DenseMatrix::new(
-        values.iter().map(PrimeField32::as_canonical_u32).collect(),
-        width,
-    );
-    reverse_matrix_index_bits(&mut input);
-
     MetalPrimeFieldExecution {
+        kind,
         width,
+        fft_size,
         modulus: F::ORDER_U32,
-        input: input.values,
-        twiddles: stage_twiddles::<F>(fft_size),
     }
 }
 
@@ -652,6 +748,14 @@ where
 }
 
 #[cfg(target_os = "macos")]
+fn stage_twiddles_for_kind(kind: MetalPrimeFieldKind, fft_size: usize) -> Vec<u32> {
+    match kind {
+        MetalPrimeFieldKind::BabyBear => stage_twiddles::<BabyBear>(fft_size),
+        MetalPrimeFieldKind::KoalaBear => stage_twiddles::<KoalaBear>(fft_size),
+    }
+}
+
+#[cfg(target_os = "macos")]
 unsafe fn cast_field_slice<F, T>(values: &[F]) -> &[T]
 where
     F: 'static,
@@ -661,6 +765,79 @@ where
     // SAFETY: callers only use this after an exact `TypeId` equality check, so
     // `F` and `T` are the same concrete type and therefore have identical layout.
     unsafe { slice::from_raw_parts(values.as_ptr().cast::<T>(), values.len()) }
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+const fn bit_reverse_index(index: usize, log_n: u32) -> usize {
+    index.reverse_bits() >> (usize::BITS - log_n)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn write_prime_field_matrix_to_buffer<F>(
+    values: &[F],
+    width: usize,
+    fft_size: usize,
+    buffer: &Buffer,
+) where
+    F: PrimeField32,
+{
+    let encoded = buffer.contents().cast::<u32>();
+    let log_h = fft_size.ilog2();
+
+    for dst_row in 0..fft_size {
+        let src_row = bit_reverse_index(dst_row, log_h);
+        let dst_start = dst_row * width;
+        let src_start = src_row * width;
+        for column in 0..width {
+            // SAFETY: caller provides a buffer with room for `width * fft_size` u32 values.
+            unsafe {
+                encoded
+                    .add(dst_start + column)
+                    .write(values[src_start + column].as_canonical_u32())
+            };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_supported_prime_field_input<F>(padded: &DenseMatrix<F>, buffer: &Buffer) -> bool
+where
+    F: TwoAdicField,
+{
+    if TypeId::of::<F>() == TypeId::of::<BabyBear>() {
+        let values = unsafe { cast_field_slice::<F, BabyBear>(&padded.values) };
+        unsafe {
+            write_prime_field_matrix_to_buffer(values, padded.width(), padded.height(), buffer)
+        };
+        return true;
+    }
+
+    if TypeId::of::<F>() == TypeId::of::<KoalaBear>() {
+        let values = unsafe { cast_field_slice::<F, KoalaBear>(&padded.values) };
+        unsafe {
+            write_prime_field_matrix_to_buffer(values, padded.width(), padded.height(), buffer)
+        };
+        return true;
+    }
+
+    false
+}
+
+#[cfg(all(target_os = "macos", test))]
+#[must_use]
+fn gpu_dispatch_count() -> usize {
+    METAL_GPU_DISPATCHES.load(Ordering::Relaxed)
+}
+
+#[cfg(target_os = "macos")]
+fn decode_prime_field_output<F>(buffer: &Buffer, len: usize) -> Vec<F>
+where
+    F: TwoAdicField,
+{
+    let output_ptr = buffer.contents().cast::<u32>();
+    let output = unsafe { slice::from_raw_parts(output_ptr, len) };
+    output.iter().copied().map(F::from_u32).collect()
 }
 
 #[inline]
@@ -707,10 +884,16 @@ where
     };
 
     match with_metal_executor(|executor| {
-        execute_prime_field_fft(executor, padded.height(), &execution)
+        execute_prime_field_fft(executor, &execution, |input_buffer| {
+            let wrote_input = write_supported_prime_field_input(&padded, input_buffer);
+            debug_assert!(
+                wrote_input,
+                "supported field required for Metal input encoding"
+            );
+        })
     }) {
-        Ok(values) => DenseMatrix::new(
-            values.into_iter().map(F::from_u32).collect(),
+        Ok(output_buffer) => DenseMatrix::new(
+            decode_prime_field_output(&output_buffer, execution.width * execution.fft_size),
             execution.width,
         ),
         Err(_) => run_base_dft_cpu(dft, padded),
@@ -779,8 +962,9 @@ where
 mod tests {
     use p3_baby_bear::BabyBear;
     use p3_dft::Radix2DFTSmallBatch;
-    use p3_field::PrimeCharacteristicRing;
+    use p3_field::{PrimeCharacteristicRing, PrimeField32, TwoAdicField};
     use p3_goldilocks::Goldilocks;
+    use p3_koala_bear::KoalaBear;
     use p3_matrix::dense::DenseMatrix;
 
     use super::{
@@ -790,6 +974,87 @@ mod tests {
     };
     use crate::whir::dft_backend::{DftElementKind, GpuDftJob, run_base_dft_cpu};
     use crate::whir::dft_layout::DftBatchLayout;
+
+    #[cfg(target_os = "macos")]
+    fn next_pseudo_random_u32(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (*state >> 32) as u32
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pseudo_random_matrix<F>(width: usize, fft_size: usize, seed: u64) -> DenseMatrix<F>
+    where
+        F: PrimeCharacteristicRing + Send + Sync + Clone,
+    {
+        let mut state = seed;
+        let values = (0..(width * fft_size))
+            .map(|_| F::from_u32(next_pseudo_random_u32(&mut state)))
+            .collect();
+        DenseMatrix::new(values, width)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_prime_field_gpu_matches_cpu<F>(cases: &[(usize, usize)], seed: u64)
+    where
+        F: PrimeField32 + TwoAdicField + PrimeCharacteristicRing + Clone,
+    {
+        if !super::is_available() {
+            print_metal_runtime_status("randomized parity skipped");
+            return;
+        }
+
+        let max_fft_size = cases
+            .iter()
+            .map(|&(_, fft_size)| fft_size)
+            .max()
+            .unwrap_or(1);
+        let dft = Radix2DFTSmallBatch::<F>::new(max_fft_size);
+
+        for (case_idx, &(width, fft_size)) in cases.iter().enumerate() {
+            let padded =
+                pseudo_random_matrix::<F>(width, fft_size, seed.wrapping_add(case_idx as u64));
+            let job = GpuDftJob {
+                element_kind: DftElementKind::BaseField,
+                batch_count: width,
+                fft_size,
+                element_count: width * fft_size,
+            };
+
+            let expected = run_base_dft_cpu(&dft, padded.clone());
+            let dispatches_before = super::gpu_dispatch_count();
+            let actual = super::run_base_dft(&dft, padded, job);
+            let dispatches_after = super::gpu_dispatch_count();
+
+            assert_eq!(
+                actual, expected,
+                "GPU mismatch for width={width}, fft_size={fft_size}"
+            );
+            assert!(
+                dispatches_after > dispatches_before,
+                "expected a real Metal dispatch for width={width}, fft_size={fft_size}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn print_metal_runtime_status(label: &str) {
+        std::println!(
+            "[{label}] Metal available: {}, dispatch count: {}",
+            super::is_available(),
+            super::gpu_dispatch_count()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn require_metal_runtime() {
+        print_metal_runtime_status("strict check");
+        assert!(
+            super::is_available(),
+            "gpu-metal strict tests require a usable Metal device"
+        );
+    }
 
     #[test]
     fn metal_dispatch_matches_commitment_shape() {
@@ -811,7 +1076,7 @@ mod tests {
         let plan = MetalExecutionPlan::from_job(job);
         assert_eq!(plan.kernel, MetalKernel::BaseFieldDft);
         assert_eq!(plan.stage_count, 21);
-        assert_eq!(plan.twiddle_count, 1 << 20);
+        assert_eq!(plan.twiddle_count, (1 << 21) - 1);
         assert_eq!(plan.input_elements, 16 * (1 << 21));
         assert_eq!(plan.scratch_elements, 16 * (1 << 21));
     }
@@ -828,7 +1093,7 @@ mod tests {
                 input_elements: 16 * (1 << 21),
                 output_elements: 16 * (1 << 21),
                 scratch_elements: 16 * (1 << 21),
-                twiddle_elements: 1 << 20,
+                twiddle_elements: (1 << 21) - 1,
             }
         );
     }
@@ -842,11 +1107,20 @@ mod tests {
         assert_eq!(buffers.input_bytes, 16 * (1 << 21) * size_of::<u32>());
         assert_eq!(buffers.output_bytes, 16 * (1 << 21) * size_of::<u32>());
         assert_eq!(buffers.scratch_bytes, 16 * (1 << 21) * size_of::<u32>());
-        assert_eq!(buffers.twiddle_bytes, (1 << 20) * size_of::<u32>());
+        assert_eq!(buffers.twiddle_bytes, ((1 << 21) - 1) * size_of::<u32>());
         assert_eq!(
             buffers.total_bytes(),
-            ((16 * (1 << 21) * 3) + (1 << 20)) * size_of::<u32>()
+            ((16 * (1 << 21) * 3) + ((1 << 21) - 1)) * size_of::<u32>()
         );
+    }
+
+    #[test]
+    fn stage_twiddles_match_execution_plan_count() {
+        let layout = DftBatchLayout::for_commitment(24, 4, 1);
+        let job = GpuDftJob::from_layout(DftElementKind::BaseField, layout);
+        let plan = MetalExecutionPlan::from_job(job);
+        let twiddles = super::stage_twiddles::<BabyBear>(job.fft_size);
+        assert_eq!(twiddles.len(), plan.twiddle_count);
     }
 
     #[test]
@@ -1033,8 +1307,15 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn metal_runtime_status_report() {
+        print_metal_runtime_status("status report");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn metal_base_field_dft_matches_cpu_for_baby_bear() {
         if !super::is_available() {
+            print_metal_runtime_status("BabyBear parity skipped");
             return;
         }
 
@@ -1048,9 +1329,98 @@ mod tests {
         };
 
         let expected = run_base_dft_cpu(&dft, padded.clone());
+        let dispatches_before = super::gpu_dispatch_count();
         let actual = super::run_base_dft(&dft, padded, job);
+        let dispatches_after = super::gpu_dispatch_count();
+        std::println!(
+            "[BabyBear parity] Metal available: true, dispatch count before: {dispatches_before}, after: {dispatches_after}"
+        );
 
         assert_eq!(actual, expected);
+        assert!(
+            dispatches_after > dispatches_before,
+            "expected a real Metal dispatch for BabyBear"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_base_field_dft_matches_cpu_for_koala_bear() {
+        if !super::is_available() {
+            print_metal_runtime_status("KoalaBear parity skipped");
+            return;
+        }
+
+        let dft = Radix2DFTSmallBatch::<KoalaBear>::default();
+        let padded = DenseMatrix::new((1_u32..=16).map(KoalaBear::from_u32).collect(), 2);
+        let job = GpuDftJob {
+            element_kind: DftElementKind::BaseField,
+            batch_count: 2,
+            fft_size: 8,
+            element_count: 16,
+        };
+
+        let expected = run_base_dft_cpu(&dft, padded.clone());
+        let dispatches_before = super::gpu_dispatch_count();
+        let actual = super::run_base_dft(&dft, padded, job);
+        let dispatches_after = super::gpu_dispatch_count();
+        std::println!(
+            "[KoalaBear parity] Metal available: true, dispatch count before: {dispatches_before}, after: {dispatches_after}"
+        );
+
+        assert_eq!(actual, expected);
+        assert!(
+            dispatches_after > dispatches_before,
+            "expected a real Metal dispatch for KoalaBear"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn randomized_baby_bear_gpu_matches_cpu_across_shapes() {
+        let cases = &[(1, 8), (2, 16), (4, 32), (8, 64), (4, 256)];
+        assert_prime_field_gpu_matches_cpu::<BabyBear>(cases, 0xBABB1E_u64);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn randomized_koala_bear_gpu_matches_cpu_across_shapes() {
+        let cases = &[(1, 8), (2, 16), (4, 32), (8, 64), (4, 256)];
+        assert_prime_field_gpu_matches_cpu::<KoalaBear>(cases, 0xC0A1ABu64);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires usable Metal device"]
+    fn strict_metal_base_field_dft_matches_cpu_for_baby_bear() {
+        require_metal_runtime();
+        metal_base_field_dft_matches_cpu_for_baby_bear();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires usable Metal device"]
+    fn strict_metal_base_field_dft_matches_cpu_for_koala_bear() {
+        require_metal_runtime();
+        metal_base_field_dft_matches_cpu_for_koala_bear();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires usable Metal device"]
+    fn strict_randomized_baby_bear_gpu_matches_cpu_across_shapes() {
+        require_metal_runtime();
+        let cases = &[(1, 8), (2, 16), (4, 32), (8, 64), (4, 256)];
+        assert_prime_field_gpu_matches_cpu::<BabyBear>(cases, 0xBABB1E_u64);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires usable Metal device"]
+    fn strict_randomized_koala_bear_gpu_matches_cpu_across_shapes() {
+        require_metal_runtime();
+        let cases = &[(1, 8), (2, 16), (4, 32), (8, 64), (4, 256)];
+        assert_prime_field_gpu_matches_cpu::<KoalaBear>(cases, 0xC0A1ABu64);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+#[doc(hidden)]
+pub mod bench_support;
 pub mod committer;
 pub mod constraints;
 pub(crate) mod dft_backend;

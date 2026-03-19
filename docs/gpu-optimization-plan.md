@@ -238,7 +238,94 @@ Success criteria:
 
 - Keep `CPU` as default backend until GPU passes correctness + benchmark gates.
 - Require deterministic behavior and stable transcript compatibility.
-- Add CI job running CPU and GPU parity tests on small/medium instances.
+
+## Definite Metal Validation
+
+The normal `gpu-metal` test suite is not, by itself, proof that Metal actually ran.
+Some parity tests intentionally return early when no usable Metal device is visible to the
+process, so they can pass on machines or CI jobs where Metal is unavailable.
+
+Use these commands instead:
+
+### 1) Print current Metal visibility
+
+```bash
+cargo test --features gpu-metal metal_runtime_status_report -- --nocapture
+```
+
+Interpretation:
+
+- If it prints `Metal available: true`, the current process can see a usable Metal runtime.
+- If it prints `Metal available: false`, all normal Metal parity tests will skip.
+
+### 2) Run the definite strict checks
+
+Run both fixed-field strict tests:
+
+```bash
+cargo test --features gpu-metal strict_metal_base_field_dft_matches_cpu_for_baby_bear -- --ignored --nocapture
+cargo test --features gpu-metal strict_metal_base_field_dft_matches_cpu_for_koala_bear -- --ignored --nocapture
+```
+
+Or run the whole strict Metal suite:
+
+```bash
+cargo test --features gpu-metal strict_ -- --ignored --nocapture
+```
+
+Interpretation:
+
+- If a strict test passes, then:
+  - Metal was available to the process.
+  - The CPU and GPU outputs matched.
+  - The dispatch counter increased, so the test observed a real Metal dispatch instead of a silent CPU fallback.
+- If a strict test fails at `gpu-metal strict tests require a usable Metal device`, then Metal was not available to that process.
+
+### 3) Optional non-strict parity checks
+
+```bash
+cargo test --features gpu-metal metal_base_field_dft_matches_cpu_for_baby_bear -- --nocapture
+cargo test --features gpu-metal metal_base_field_dft_matches_cpu_for_koala_bear -- --nocapture
+```
+
+These tests now print either:
+
+- a skip message with `Metal available: false`
+- or a line showing `dispatch count before` and `after`
+
+Those logs make it obvious whether the test really used Metal or returned early.
+
+## DFT Microbenchmark
+
+There is now a dedicated Criterion microbenchmark at `benches/dft.rs`.
+It measures padded base-field DFT execution directly, rather than the whole WHIR commit path.
+
+Benchmarked shapes:
+
+- `1 x 256`
+- `4 x 4096`
+- `16 x 32768`
+- `16 x 65536`
+- `16 x 131072`
+- `16 x 262144`
+
+Run CPU-only:
+
+```bash
+cargo bench --bench dft -- --noplot
+```
+
+Run with Metal enabled:
+
+```bash
+cargo bench --bench dft --features gpu-metal -- --noplot
+```
+
+Interpretation:
+
+- The CPU-only build reports only `cpu/...` benchmark series.
+- If `gpu-metal` is enabled and Metal is available to the process, the benchmark reports both `cpu/...` and `metal/...` series in the same run.
+- If `gpu-metal` is enabled but Metal is unavailable, the bench prints a skip message and reports only `cpu/...` series.
 
 ## Current Implementation Status
 
@@ -257,7 +344,7 @@ Success criteria:
 - Backend paths are split:
   - `gpu-metal` feature for Metal path
   - `gpu-vulkan` feature for Vulkan path
-- Current GPU paths are intentionally CPU fallbacks until kernels are implemented.
+- The Metal base-field DFT path now has a real compute dispatch for supported fields, with CPU fallback when Metal is unavailable or the field is unsupported.
 
 Build matrix currently validated:
 
