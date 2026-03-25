@@ -4,9 +4,11 @@ use p3_koala_bear::KoalaBear;
 use p3_matrix::dense::DenseMatrix;
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use std::time::Duration;
-#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
-use whir_p3::whir::bench_support::metal_available;
 use whir_p3::whir::bench_support::{BaseDftBenchmarkBackend, backend_name, run_padded_base_dft};
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+use whir_p3::whir::bench_support::{
+    metal_available, prepare_metal_kernel_only_base_dft, run_metal_kernel_only_base_dft,
+};
 
 type F = KoalaBear;
 
@@ -110,5 +112,87 @@ fn benchmark_padded_base_dft(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+fn benchmark_metal_kernel_only_base_dft(c: &mut Criterion) {
+    if !metal_available() {
+        std::eprintln!(
+            "gpu-metal enabled, but Metal is unavailable to this process; skipping dispatch-only metal DFT benchmarks"
+        );
+        return;
+    }
+
+    let mut group = c.benchmark_group("dft_padded_base_metal_kernel_only");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(8));
+
+    let cases = [
+        DftCase {
+            name: "tiny_1x256",
+            width: 1,
+            fft_size: 1 << 8,
+        },
+        DftCase {
+            name: "small_4x4096",
+            width: 4,
+            fft_size: 1 << 12,
+        },
+        DftCase {
+            name: "whir_round3_16x32768",
+            width: 16,
+            fft_size: 1 << 15,
+        },
+        DftCase {
+            name: "whir_round2_16x65536",
+            width: 16,
+            fft_size: 1 << 16,
+        },
+        DftCase {
+            name: "whir_round1_16x131072",
+            width: 16,
+            fft_size: 1 << 17,
+        },
+        DftCase {
+            name: "whir_round0_16x262144",
+            width: 16,
+            fft_size: 1 << 18,
+        },
+    ];
+
+    for (idx, case) in cases.into_iter().enumerate() {
+        let padded = generate_padded_matrix(case, 0xD3F7_1000_u64.wrapping_add(idx as u64));
+        let Some(prepared) = prepare_metal_kernel_only_base_dft(&padded) else {
+            std::eprintln!(
+                "failed to prepare dispatch-only Metal benchmark for {}",
+                case.name
+            );
+            continue;
+        };
+        group.throughput(Throughput::Elements(case.element_count() as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(case.name),
+            &case,
+            |b, &_case| {
+                b.iter(|| {
+                    let ran = run_metal_kernel_only_base_dft(&prepared);
+                    assert!(
+                        ran,
+                        "dispatch-only Metal benchmark failed for {}",
+                        case.name
+                    );
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+criterion_group!(
+    benches,
+    benchmark_padded_base_dft,
+    benchmark_metal_kernel_only_base_dft
+);
+#[cfg(not(all(feature = "gpu-metal", target_os = "macos")))]
 criterion_group!(benches, benchmark_padded_base_dft);
 criterion_main!(benches);

@@ -18,6 +18,8 @@ use std::{cell::RefCell, sync::OnceLock, thread_local, vec::Vec};
 use super::{DftElementKind, GpuDftJob, run_base_dft_cpu};
 
 const THREADS_PER_THREADGROUP: usize = 256;
+const MAX_FUSED_PREFIX_TILE_ROWS: usize = 32;
+const MAX_THREADGROUP_TILE_ELEMENTS: usize = 256;
 
 #[cfg(target_os = "macos")]
 static METAL_RUNTIME: OnceLock<MetalRuntime> = OnceLock::new();
@@ -49,10 +51,25 @@ const METAL_BASE_FIELD_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
+constant uint FIELD_KIND_BABY_BEAR = 0;
+constant uint FIELD_KIND_KOALA_BEAR = 1;
+constant uint PSEUDO_MERSENNE_MASK = 0x7fffffff;
+constant uint BABY_BEAR_C = 0x07ffffff;
+constant uint KOALA_BEAR_C = 0x00ffffff;
+
 struct StageParams {
     uint width;
     uint half_size;
     uint span;
+    uint field_kind;
+    uint modulus;
+};
+
+struct PrefixParams {
+    uint width;
+    uint tile_rows;
+    uint log_fft_size;
+    uint field_kind;
     uint modulus;
 };
 
@@ -65,8 +82,34 @@ inline uint sub_mod(uint a, uint b, uint modulus) {
     return a >= b ? a - b : modulus - (b - a);
 }
 
-inline uint mul_mod(uint a, uint b, uint modulus) {
-    return (uint)(((ulong)a * (ulong)b) % (ulong)modulus);
+inline ulong reduce_pseudo_mersenne_once(ulong x, uint c) {
+    return (x & (ulong)PSEUDO_MERSENNE_MASK) + (x >> 31) * (ulong)c;
+}
+
+inline uint reduce_pseudo_mersenne(ulong x, uint modulus, uint c) {
+    while ((x >> 31) != 0) {
+        x = reduce_pseudo_mersenne_once(x, c);
+    }
+
+    uint reduced = (uint)x;
+    if (reduced >= modulus) {
+        reduced -= modulus;
+    }
+    if (reduced >= modulus) {
+        reduced -= modulus;
+    }
+    return reduced;
+}
+
+inline uint mul_mod(uint a, uint b, uint field_kind, uint modulus) {
+    ulong product = (ulong)a * (ulong)b;
+    if (field_kind == FIELD_KIND_BABY_BEAR) {
+        return reduce_pseudo_mersenne(product, modulus, BABY_BEAR_C);
+    }
+    if (field_kind == FIELD_KIND_KOALA_BEAR) {
+        return reduce_pseudo_mersenne(product, modulus, KOALA_BEAR_C);
+    }
+    return (uint)(product % (ulong)modulus);
 }
 
 kernel void base_field_dft_stage(
@@ -87,15 +130,72 @@ kernel void base_field_dft_stage(
     uint a = input[lo];
     uint b = input[hi];
     uint twiddle = twiddles[offset_in_block];
-    uint product = mul_mod(b, twiddle, params.modulus);
+    uint product = mul_mod(b, twiddle, params.field_kind, params.modulus);
 
     output[lo] = add_mod(a, product, params.modulus);
     output[hi] = sub_mod(a, product, params.modulus);
+}
+
+kernel void base_field_dft_prefix(
+    device const uint* input [[buffer(0)]],
+    device uint* output [[buffer(1)]],
+    device const uint* twiddles [[buffer(2)]],
+    constant PrefixParams& params [[buffer(3)]],
+    uint local_tid [[thread_index_in_threadgroup]],
+    uint tile_index [[threadgroup_position_in_grid]]
+) {
+    threadgroup uint tile[256];
+
+    uint pair_count = params.width * (params.tile_rows >> 1);
+    if (local_tid >= pair_count) {
+        return;
+    }
+
+    uint pair = local_tid / params.width;
+    uint column = local_tid - pair * params.width;
+    uint row_lo = pair << 1;
+    uint row_hi = row_lo + 1;
+    uint global_base_row = tile_index * params.tile_rows;
+    uint global_row_lo = global_base_row + row_lo;
+    uint global_row_hi = global_base_row + row_hi;
+    uint input_row_lo = reverse_bits(global_row_lo) >> (32 - params.log_fft_size);
+    uint input_row_hi = reverse_bits(global_row_hi) >> (32 - params.log_fft_size);
+    uint tile_lo = row_lo * params.width + column;
+    uint tile_hi = row_hi * params.width + column;
+
+    tile[tile_lo] = input[input_row_lo * params.width + column];
+    tile[tile_hi] = input[input_row_hi * params.width + column];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint twiddle_offset = 0;
+    for (uint stage = 0; (1u << stage) < params.tile_rows; stage++) {
+        uint half_size = 1u << stage;
+        uint span = half_size << 1;
+        uint offset_in_block = pair % half_size;
+        uint block = pair / half_size;
+        uint row = block * span + offset_in_block;
+        uint lo = row * params.width + column;
+        uint hi = lo + half_size * params.width;
+        uint twiddle = twiddles[twiddle_offset + offset_in_block];
+        uint a = tile[lo];
+        uint b = tile[hi];
+        uint product = mul_mod(b, twiddle, params.field_kind, params.modulus);
+
+        tile[lo] = add_mod(a, product, params.modulus);
+        tile[hi] = sub_mod(a, product, params.modulus);
+        twiddle_offset += half_size;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    output[(global_base_row + row_lo) * params.width + column] = tile[tile_lo];
+    output[(global_base_row + row_hi) * params.width + column] = tile[tile_hi];
 }
 "#;
 
 #[cfg(target_os = "macos")]
 const METAL_BASE_FIELD_KERNEL_NAME: &str = "base_field_dft_stage";
+#[cfg(target_os = "macos")]
+const METAL_BASE_FIELD_PREFIX_KERNEL_NAME: &str = "base_field_dft_prefix";
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
@@ -104,6 +204,18 @@ struct MetalStageParams {
     width: u32,
     half_size: u32,
     span: u32,
+    field_kind: u32,
+    modulus: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct MetalPrefixParams {
+    width: u32,
+    tile_rows: u32,
+    log_fft_size: u32,
+    field_kind: u32,
     modulus: u32,
 }
 
@@ -121,7 +233,8 @@ struct MetalPrimeFieldExecution {
 struct MetalExecutor {
     device: Device,
     queue: CommandQueue,
-    pipeline: ComputePipelineState,
+    stage_pipeline: ComputePipelineState,
+    prefix_pipeline: ComputePipelineState,
     threads_per_threadgroup: usize,
     resources: MetalResourceCache,
 }
@@ -151,9 +264,20 @@ struct MetalTwiddleCacheEntry {
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 struct MetalResourceCache {
-    input: Option<Buffer>,
-    scratch: Option<Buffer>,
+    source: Option<Buffer>,
+    work_a: Option<Buffer>,
+    work_b: Option<Buffer>,
     twiddles: Vec<MetalTwiddleCacheEntry>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub(super) struct MetalDispatchOnlyBenchmark {
+    execution: MetalPrimeFieldExecution,
+    source_buffer: Buffer,
+    work_a_buffer: Buffer,
+    work_b_buffer: Buffer,
+    twiddle_buffer: Buffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +302,54 @@ impl MetalDispatch {
             threads_per_threadgroup: THREADS_PER_THREADGROUP,
             threadgroups_per_grid_x,
             threadgroups_per_grid_y,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MetalPrimeFieldKind {
+    #[must_use]
+    const fn shader_field_kind(self) -> u32 {
+        match self {
+            Self::BabyBear => 0,
+            Self::KoalaBear => 1,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MetalPrimeFieldExecution {
+    #[must_use]
+    const fn input_len(&self) -> usize {
+        self.width * self.fft_size
+    }
+
+    #[must_use]
+    const fn field_kind_u32(&self) -> u32 {
+        self.kind.shader_field_kind()
+    }
+
+    #[must_use]
+    fn prefix_tile_rows(&self) -> usize {
+        let max_rows_from_width = MAX_THREADGROUP_TILE_ELEMENTS / self.width;
+        let max_rows = self
+            .fft_size
+            .min(MAX_FUSED_PREFIX_TILE_ROWS)
+            .min(max_rows_from_width);
+        if max_rows < 2 {
+            0
+        } else {
+            1usize << max_rows.ilog2()
+        }
+    }
+
+    #[must_use]
+    fn prefix_stage_count(&self) -> usize {
+        let tile_rows = self.prefix_tile_rows();
+        if tile_rows < 2 {
+            0
+        } else {
+            tile_rows.ilog2() as usize
         }
     }
 }
@@ -313,11 +485,11 @@ impl MetalResourceCache {
         device: &Device,
         input_bytes: u64,
         options: MTLResourceOptions,
-    ) -> Result<(Buffer, Buffer), MetalDiscoveryError> {
-        let input = Self::ensure_reusable_buffer(device, &mut self.input, input_bytes, options)?;
-        let scratch =
-            Self::ensure_reusable_buffer(device, &mut self.scratch, input_bytes, options)?;
-        Ok((input, scratch))
+    ) -> Result<(Buffer, Buffer, Buffer), MetalDiscoveryError> {
+        let source = Self::ensure_reusable_buffer(device, &mut self.source, input_bytes, options)?;
+        let work_a = Self::ensure_reusable_buffer(device, &mut self.work_a, input_bytes, options)?;
+        let work_b = Self::ensure_reusable_buffer(device, &mut self.work_b, input_bytes, options)?;
+        Ok((source, work_a, work_b))
     }
 
     fn twiddle_buffer(
@@ -565,21 +737,28 @@ impl MetalExecutor {
         let library = device
             .new_library_with_source(METAL_BASE_FIELD_SHADER, &options)
             .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
-        let function = library
+        let stage_function = library
             .get_function(METAL_BASE_FIELD_KERNEL_NAME, None)
             .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
-        let pipeline = device
-            .new_compute_pipeline_state_with_function(&function)
+        let stage_pipeline = device
+            .new_compute_pipeline_state_with_function(&stage_function)
             .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
-        let threads_per_threadgroup = pipeline
+        let prefix_function = library
+            .get_function(METAL_BASE_FIELD_PREFIX_KERNEL_NAME, None)
+            .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+        let prefix_pipeline = device
+            .new_compute_pipeline_state_with_function(&prefix_function)
+            .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+        let threads_per_threadgroup = stage_pipeline
             .thread_execution_width()
-            .min(pipeline.max_total_threads_per_threadgroup())
+            .min(stage_pipeline.max_total_threads_per_threadgroup())
             .min(THREADS_PER_THREADGROUP as u64) as usize;
 
         Ok(Self {
             device,
             queue,
-            pipeline,
+            stage_pipeline,
+            prefix_pipeline,
             threads_per_threadgroup,
             resources: MetalResourceCache::default(),
         })
@@ -603,47 +782,71 @@ fn with_metal_executor<R>(
 }
 
 #[cfg(target_os = "macos")]
-fn execute_prime_field_fft(
-    executor: &mut MetalExecutor,
+fn dispatch_prime_field_fft(
+    executor: &MetalExecutor,
     execution: &MetalPrimeFieldExecution,
-    write_input: impl FnOnce(&Buffer),
-) -> Result<Buffer, MetalDiscoveryError> {
-    let input_len = execution.width * execution.fft_size;
-    let buffer_len_bytes = (input_len * size_of::<u32>()) as u64;
-    let options = MTLResourceOptions::StorageModeShared;
-    let (input_buffer, scratch_buffer) =
-        executor
-            .resources
-            .execution_buffers(&executor.device, buffer_len_bytes, options)?;
-    let twiddle_key = MetalTwiddleKey {
-        kind: execution.kind,
-        fft_size: execution.fft_size,
-        modulus: execution.modulus,
-    };
-    let twiddle_buffer =
-        executor
-            .resources
-            .twiddle_buffer(&executor.device, twiddle_key, options)?;
-
-    write_input(&input_buffer);
-    input_buffer.did_modify_range(NSRange::new(0, buffer_len_bytes));
-
+    source_buffer: &Buffer,
+    work_a_buffer: &Buffer,
+    work_b_buffer: &Buffer,
+    twiddle_buffer: &Buffer,
+) -> Buffer {
     let command_buffer = executor.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&executor.pipeline);
-
+    let prefix_stage_count = execution.prefix_stage_count();
     let mut twiddle_offset = 0usize;
-    let mut src_buffer = input_buffer;
-    let mut dst_buffer = scratch_buffer;
+    let mut src_buffer = source_buffer.clone();
+    let mut dst_buffer = work_a_buffer.clone();
+
+    if prefix_stage_count > 0 {
+        let tile_rows = execution.prefix_tile_rows();
+        let pair_count = execution.width * (tile_rows / 2);
+        let tile_count = execution.fft_size / tile_rows;
+        let prefix_params = MetalPrefixParams {
+            width: execution.width as u32,
+            tile_rows: tile_rows as u32,
+            log_fft_size: execution.fft_size.ilog2(),
+            field_kind: execution.field_kind_u32(),
+            modulus: execution.modulus,
+        };
+
+        encoder.set_compute_pipeline_state(&executor.prefix_pipeline);
+        encoder.set_buffer(0, Some(&src_buffer), 0);
+        encoder.set_buffer(1, Some(&dst_buffer), 0);
+        encoder.set_buffer(2, Some(twiddle_buffer), 0);
+        encoder.set_bytes(
+            3,
+            size_of::<MetalPrefixParams>() as u64,
+            (&prefix_params as *const MetalPrefixParams).cast::<c_void>(),
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize {
+                width: tile_count as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: pair_count as u64,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        twiddle_offset = tile_rows - 1;
+        src_buffer = dst_buffer;
+        dst_buffer = work_b_buffer.clone();
+    }
+
+    encoder.set_compute_pipeline_state(&executor.stage_pipeline);
     let butterfly_count = execution.width * (execution.fft_size / 2);
     let threads_per_threadgroup = executor.threads_per_threadgroup.min(butterfly_count.max(1));
 
-    for stage in 0..execution.fft_size.ilog2() as usize {
+    for stage in prefix_stage_count..execution.fft_size.ilog2() as usize {
         let half_size = 1usize << stage;
         let stage_params = MetalStageParams {
             width: execution.width as u32,
             half_size: half_size as u32,
             span: (half_size << 1) as u32,
+            field_kind: execution.field_kind_u32(),
             modulus: execution.modulus,
         };
 
@@ -651,7 +854,7 @@ fn execute_prime_field_fft(
         encoder.set_buffer(1, Some(&dst_buffer), 0);
         encoder.set_buffer(
             2,
-            Some(&twiddle_buffer),
+            Some(twiddle_buffer),
             (twiddle_offset * size_of::<u32>()) as u64,
         );
         encoder.set_bytes(
@@ -681,9 +884,43 @@ fn execute_prime_field_fft(
     command_buffer.wait_until_completed();
     #[cfg(test)]
     METAL_GPU_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    src_buffer
+}
+
+#[cfg(target_os = "macos")]
+fn execute_prime_field_fft(
+    executor: &mut MetalExecutor,
+    execution: &MetalPrimeFieldExecution,
+    write_input: impl FnOnce(&Buffer),
+) -> Result<Buffer, MetalDiscoveryError> {
+    let input_len = execution.input_len();
+    let buffer_len_bytes = (input_len * size_of::<u32>()) as u64;
+    let options = MTLResourceOptions::StorageModeShared;
+    let (source_buffer, work_a_buffer, work_b_buffer) =
+        executor
+            .resources
+            .execution_buffers(&executor.device, buffer_len_bytes, options)?;
+    let twiddle_key = MetalTwiddleKey {
+        kind: execution.kind,
+        fft_size: execution.fft_size,
+        modulus: execution.modulus,
+    };
+    let twiddle_buffer =
+        executor
+            .resources
+            .twiddle_buffer(&executor.device, twiddle_key, options)?;
+
+    write_input(&source_buffer);
 
     debug_assert_eq!(input_len, execution.width * execution.fft_size);
-    Ok(src_buffer)
+    Ok(dispatch_prime_field_fft(
+        executor,
+        execution,
+        &source_buffer,
+        &work_a_buffer,
+        &work_b_buffer,
+        &twiddle_buffer,
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -801,6 +1038,18 @@ unsafe fn write_prime_field_matrix_to_buffer<F>(
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn write_prime_field_matrix_to_buffer_natural<F>(values: &[F], buffer: &Buffer)
+where
+    F: PrimeField32,
+{
+    let encoded = buffer.contents().cast::<u32>();
+    for (idx, value) in values.iter().enumerate() {
+        // SAFETY: caller provides a buffer with room for `values.len()` u32 values.
+        unsafe { encoded.add(idx).write(value.as_canonical_u32()) };
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn write_supported_prime_field_input<F>(padded: &DenseMatrix<F>, buffer: &Buffer) -> bool
 where
     F: TwoAdicField,
@@ -822,6 +1071,49 @@ where
     }
 
     false
+}
+
+#[cfg(target_os = "macos")]
+fn write_supported_prime_field_input_natural<F>(padded: &DenseMatrix<F>, buffer: &Buffer) -> bool
+where
+    F: TwoAdicField,
+{
+    if TypeId::of::<F>() == TypeId::of::<BabyBear>() {
+        let values = unsafe { cast_field_slice::<F, BabyBear>(&padded.values) };
+        unsafe { write_prime_field_matrix_to_buffer_natural(values, buffer) };
+        return true;
+    }
+
+    if TypeId::of::<F>() == TypeId::of::<KoalaBear>() {
+        let values = unsafe { cast_field_slice::<F, KoalaBear>(&padded.values) };
+        unsafe { write_prime_field_matrix_to_buffer_natural(values, buffer) };
+        return true;
+    }
+
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn upload_supported_prime_field_input<F>(
+    padded: &DenseMatrix<F>,
+    execution: &MetalPrimeFieldExecution,
+    buffer: &Buffer,
+) -> bool
+where
+    F: TwoAdicField,
+{
+    let wrote_input = if execution.prefix_stage_count() > 0 {
+        write_supported_prime_field_input_natural(padded, buffer)
+    } else {
+        write_supported_prime_field_input(padded, buffer)
+    };
+    if wrote_input {
+        buffer.did_modify_range(NSRange::new(
+            0,
+            (execution.input_len() * size_of::<u32>()) as u64,
+        ));
+    }
+    wrote_input
 }
 
 #[cfg(all(target_os = "macos", test))]
@@ -882,10 +1174,9 @@ where
     let Some(execution) = try_prepare_prime_field_execution(&padded) else {
         return run_base_dft_cpu(dft, padded);
     };
-
     match with_metal_executor(|executor| {
         execute_prime_field_fft(executor, &execution, |input_buffer| {
-            let wrote_input = write_supported_prime_field_input(&padded, input_buffer);
+            let wrote_input = upload_supported_prime_field_input(&padded, &execution, input_buffer);
             debug_assert!(
                 wrote_input,
                 "supported field required for Metal input encoding"
@@ -898,6 +1189,63 @@ where
         ),
         Err(_) => run_base_dft_cpu(dft, padded),
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn prepare_dispatch_only_benchmark<F>(
+    padded: &DenseMatrix<F>,
+) -> Option<MetalDispatchOnlyBenchmark>
+where
+    F: TwoAdicField,
+{
+    let execution = try_prepare_prime_field_execution(padded)?;
+
+    with_metal_executor(|executor| {
+        let input_bytes = (execution.input_len() * size_of::<u32>()) as u64;
+        let options = MTLResourceOptions::StorageModeShared;
+        let (source_buffer, work_a_buffer, work_b_buffer) =
+            executor
+                .resources
+                .execution_buffers(&executor.device, input_bytes, options)?;
+        let twiddle_buffer = executor.resources.twiddle_buffer(
+            &executor.device,
+            MetalTwiddleKey {
+                kind: execution.kind,
+                fft_size: execution.fft_size,
+                modulus: execution.modulus,
+            },
+            options,
+        )?;
+
+        if !upload_supported_prime_field_input(padded, &execution, &source_buffer) {
+            return Err(MetalDiscoveryError::DeviceUnavailable);
+        }
+
+        Ok(MetalDispatchOnlyBenchmark {
+            execution,
+            source_buffer,
+            work_a_buffer,
+            work_b_buffer,
+            twiddle_buffer,
+        })
+    })
+    .ok()
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn run_dispatch_only_benchmark(benchmark: &MetalDispatchOnlyBenchmark) -> bool {
+    with_metal_executor(|executor| {
+        let _ = dispatch_prime_field_fft(
+            executor,
+            &benchmark.execution,
+            &benchmark.source_buffer,
+            &benchmark.work_a_buffer,
+            &benchmark.work_b_buffer,
+            &benchmark.twiddle_buffer,
+        );
+        Ok(())
+    })
+    .is_ok()
 }
 
 #[cfg(all(target_os = "macos", test))]

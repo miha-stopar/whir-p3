@@ -243,6 +243,29 @@ pub(super) fn metal_is_available_for_bench() -> bool {
     metal::is_available()
 }
 
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+#[derive(Debug)]
+pub(super) struct MetalDispatchOnlyBenchmark {
+    inner: metal::MetalDispatchOnlyBenchmark,
+}
+
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+pub(super) fn prepare_padded_base_dft_dispatch_only_metal<F>(
+    padded: &DenseMatrix<F>,
+) -> Option<MetalDispatchOnlyBenchmark>
+where
+    F: TwoAdicField,
+{
+    metal::prepare_dispatch_only_benchmark(padded).map(|inner| MetalDispatchOnlyBenchmark { inner })
+}
+
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+pub(super) fn run_padded_base_dft_dispatch_only_metal(
+    benchmark: &MetalDispatchOnlyBenchmark,
+) -> bool {
+    metal::run_dispatch_only_benchmark(&benchmark.inner)
+}
+
 #[cfg(test)]
 #[inline]
 pub(super) fn run_ext_dft_cpu<F, EF, Dft>(dft: &Dft, padded: DenseMatrix<EF>) -> DenseMatrix<EF>

@@ -8,6 +8,10 @@ use p3_field::TwoAdicField;
 use p3_matrix::dense::DenseMatrix;
 
 use crate::whir::dft_backend::run_padded_base_dft_explicit_cpu;
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+use crate::whir::dft_backend::{
+    prepare_padded_base_dft_dispatch_only_metal, run_padded_base_dft_dispatch_only_metal,
+};
 
 /// Explicit backend choice for padded base-field DFT microbenchmarks.
 #[doc(hidden)]
@@ -16,6 +20,14 @@ pub enum BaseDftBenchmarkBackend {
     Cpu,
     #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
     Metal,
+}
+
+/// Prepared dispatch-only Metal benchmark state.
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct MetalKernelOnlyBenchmark {
+    inner: crate::whir::dft_backend::MetalDispatchOnlyBenchmark,
 }
 
 /// Return whether a usable Metal runtime is visible to the current process.
@@ -62,4 +74,24 @@ where
             crate::whir::dft_backend::run_padded_base_dft_explicit_metal(dft, padded)
         }
     }
+}
+
+/// Prepare a dispatch-only Metal benchmark state with input already uploaded.
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+#[doc(hidden)]
+pub fn prepare_metal_kernel_only_base_dft<F>(
+    padded: &DenseMatrix<F>,
+) -> Option<MetalKernelOnlyBenchmark>
+where
+    F: TwoAdicField,
+{
+    prepare_padded_base_dft_dispatch_only_metal(padded)
+        .map(|inner| MetalKernelOnlyBenchmark { inner })
+}
+
+/// Run the already-uploaded Metal DFT benchmark state without host marshaling.
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+#[doc(hidden)]
+pub fn run_metal_kernel_only_base_dft(benchmark: &MetalKernelOnlyBenchmark) -> bool {
+    run_padded_base_dft_dispatch_only_metal(&benchmark.inner)
 }
