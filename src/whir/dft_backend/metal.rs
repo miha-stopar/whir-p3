@@ -18,8 +18,8 @@ use std::{cell::RefCell, sync::OnceLock, thread_local, vec::Vec};
 use super::{DftElementKind, GpuDftJob, run_base_dft_cpu};
 
 const THREADS_PER_THREADGROUP: usize = 256;
-const MAX_FUSED_PREFIX_TILE_ROWS: usize = 32;
-const MAX_THREADGROUP_TILE_ELEMENTS: usize = 256;
+const MAX_FUSED_PREFIX_TILE_ROWS: usize = 64;
+const MAX_THREADGROUP_TILE_ELEMENTS: usize = 1024;
 
 #[cfg(target_os = "macos")]
 static METAL_RUNTIME: OnceLock<MetalRuntime> = OnceLock::new();
@@ -144,7 +144,7 @@ kernel void base_field_dft_prefix(
     uint local_tid [[thread_index_in_threadgroup]],
     uint tile_index [[threadgroup_position_in_grid]]
 ) {
-    threadgroup uint tile[256];
+    threadgroup uint tile[1024];
 
     uint pair_count = params.width * (params.tile_rows >> 1);
     if (local_tid >= pair_count) {
@@ -236,6 +236,7 @@ struct MetalExecutor {
     stage_pipeline: ComputePipelineState,
     prefix_pipeline: ComputePipelineState,
     threads_per_threadgroup: usize,
+    prefix_threads_per_threadgroup: usize,
     resources: MetalResourceCache,
 }
 
@@ -330,8 +331,10 @@ impl MetalPrimeFieldExecution {
     }
 
     #[must_use]
-    fn prefix_tile_rows(&self) -> usize {
-        let max_rows_from_width = MAX_THREADGROUP_TILE_ELEMENTS / self.width;
+    fn prefix_tile_rows(&self, prefix_threads_per_threadgroup: usize) -> usize {
+        let max_tile_elements = MAX_THREADGROUP_TILE_ELEMENTS
+            .min(prefix_threads_per_threadgroup.saturating_mul(2).max(2));
+        let max_rows_from_width = max_tile_elements / self.width;
         let max_rows = self
             .fft_size
             .min(MAX_FUSED_PREFIX_TILE_ROWS)
@@ -344,8 +347,8 @@ impl MetalPrimeFieldExecution {
     }
 
     #[must_use]
-    fn prefix_stage_count(&self) -> usize {
-        let tile_rows = self.prefix_tile_rows();
+    fn prefix_stage_count(&self, prefix_threads_per_threadgroup: usize) -> usize {
+        let tile_rows = self.prefix_tile_rows(prefix_threads_per_threadgroup);
         if tile_rows < 2 {
             0
         } else {
@@ -753,6 +756,8 @@ impl MetalExecutor {
             .thread_execution_width()
             .min(stage_pipeline.max_total_threads_per_threadgroup())
             .min(THREADS_PER_THREADGROUP as u64) as usize;
+        let prefix_threads_per_threadgroup =
+            prefix_pipeline.max_total_threads_per_threadgroup() as usize;
 
         Ok(Self {
             device,
@@ -760,6 +765,7 @@ impl MetalExecutor {
             stage_pipeline,
             prefix_pipeline,
             threads_per_threadgroup,
+            prefix_threads_per_threadgroup,
             resources: MetalResourceCache::default(),
         })
     }
@@ -792,13 +798,13 @@ fn dispatch_prime_field_fft(
 ) -> Buffer {
     let command_buffer = executor.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
-    let prefix_stage_count = execution.prefix_stage_count();
+    let prefix_stage_count = execution.prefix_stage_count(executor.prefix_threads_per_threadgroup);
     let mut twiddle_offset = 0usize;
     let mut src_buffer = source_buffer.clone();
     let mut dst_buffer = work_a_buffer.clone();
 
     if prefix_stage_count > 0 {
-        let tile_rows = execution.prefix_tile_rows();
+        let tile_rows = execution.prefix_tile_rows(executor.prefix_threads_per_threadgroup);
         let pair_count = execution.width * (tile_rows / 2);
         let tile_count = execution.fft_size / tile_rows;
         let prefix_params = MetalPrefixParams {
@@ -891,7 +897,7 @@ fn dispatch_prime_field_fft(
 fn execute_prime_field_fft(
     executor: &mut MetalExecutor,
     execution: &MetalPrimeFieldExecution,
-    write_input: impl FnOnce(&Buffer),
+    write_input: impl FnOnce(&Buffer, bool),
 ) -> Result<Buffer, MetalDiscoveryError> {
     let input_len = execution.input_len();
     let buffer_len_bytes = (input_len * size_of::<u32>()) as u64;
@@ -910,7 +916,9 @@ fn execute_prime_field_fft(
             .resources
             .twiddle_buffer(&executor.device, twiddle_key, options)?;
 
-    write_input(&source_buffer);
+    let use_natural_order =
+        execution.prefix_stage_count(executor.prefix_threads_per_threadgroup) > 0;
+    write_input(&source_buffer, use_natural_order);
 
     debug_assert_eq!(input_len, execution.width * execution.fft_size);
     Ok(dispatch_prime_field_fft(
@@ -1096,22 +1104,20 @@ where
 #[cfg(target_os = "macos")]
 fn upload_supported_prime_field_input<F>(
     padded: &DenseMatrix<F>,
-    execution: &MetalPrimeFieldExecution,
+    use_natural_order: bool,
+    input_len: usize,
     buffer: &Buffer,
 ) -> bool
 where
     F: TwoAdicField,
 {
-    let wrote_input = if execution.prefix_stage_count() > 0 {
+    let wrote_input = if use_natural_order {
         write_supported_prime_field_input_natural(padded, buffer)
     } else {
         write_supported_prime_field_input(padded, buffer)
     };
     if wrote_input {
-        buffer.did_modify_range(NSRange::new(
-            0,
-            (execution.input_len() * size_of::<u32>()) as u64,
-        ));
+        buffer.did_modify_range(NSRange::new(0, (input_len * size_of::<u32>()) as u64));
     }
     wrote_input
 }
@@ -1175,8 +1181,13 @@ where
         return run_base_dft_cpu(dft, padded);
     };
     match with_metal_executor(|executor| {
-        execute_prime_field_fft(executor, &execution, |input_buffer| {
-            let wrote_input = upload_supported_prime_field_input(&padded, &execution, input_buffer);
+        execute_prime_field_fft(executor, &execution, |input_buffer, use_natural_order| {
+            let wrote_input = upload_supported_prime_field_input(
+                &padded,
+                use_natural_order,
+                execution.input_len(),
+                input_buffer,
+            );
             debug_assert!(
                 wrote_input,
                 "supported field required for Metal input encoding"
@@ -1217,7 +1228,14 @@ where
             options,
         )?;
 
-        if !upload_supported_prime_field_input(padded, &execution, &source_buffer) {
+        let use_natural_order =
+            execution.prefix_stage_count(executor.prefix_threads_per_threadgroup) > 0;
+        if !upload_supported_prime_field_input(
+            padded,
+            use_natural_order,
+            execution.input_len(),
+            &source_buffer,
+        ) {
             return Err(MetalDiscoveryError::DeviceUnavailable);
         }
 
