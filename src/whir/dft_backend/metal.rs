@@ -1,4 +1,9 @@
-use core::{any::TypeId, ffi::c_void, mem::size_of, slice};
+use core::{
+    any::TypeId,
+    ffi::c_void,
+    mem::{align_of, size_of},
+    slice,
+};
 
 #[cfg(target_os = "macos")]
 use metal::{
@@ -7,7 +12,7 @@ use metal::{
 };
 use p3_baby_bear::BabyBear;
 use p3_dft::TwoAdicSubgroupDft;
-use p3_field::{PrimeField32, TwoAdicField};
+use p3_field::{ExtensionField, PrimeField32, TwoAdicField};
 use p3_koala_bear::KoalaBear;
 use p3_matrix::{Matrix, dense::DenseMatrix};
 #[cfg(all(target_os = "macos", test))]
@@ -15,7 +20,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(target_os = "macos")]
 use std::{cell::RefCell, sync::OnceLock, thread_local, vec::Vec};
 
-use super::{DftElementKind, GpuDftJob, run_base_dft_cpu};
+use super::{
+    DftElementKind, GpuDftJob, reshape_transpose_pad, reshape_transpose_pad_ext_to_base,
+    run_base_dft_cpu,
+};
+use crate::whir::dft_layout::DftBatchLayout;
 
 const THREADS_PER_THREADGROUP: usize = 256;
 const MAX_FUSED_PREFIX_TILE_ROWS: usize = 64;
@@ -53,9 +62,8 @@ using namespace metal;
 
 constant uint FIELD_KIND_BABY_BEAR = 0;
 constant uint FIELD_KIND_KOALA_BEAR = 1;
-constant uint PSEUDO_MERSENNE_MASK = 0x7fffffff;
-constant uint BABY_BEAR_C = 0x07ffffff;
-constant uint KOALA_BEAR_C = 0x00ffffff;
+constant uint BABY_BEAR_MONTY_MU = 0x88000001;
+constant uint KOALA_BEAR_MONTY_MU = 0x81000001;
 
 struct StageParams {
     uint width;
@@ -73,6 +81,15 @@ struct PrefixParams {
     uint modulus;
 };
 
+struct StagePairParams {
+    uint width;
+    uint columns_per_group;
+    uint chunk_count;
+    uint half_size;
+    uint field_kind;
+    uint modulus;
+};
+
 inline uint add_mod(uint a, uint b, uint modulus) {
     ulong sum = (ulong)a + (ulong)b;
     return sum >= (ulong)modulus ? (uint)(sum - (ulong)modulus) : (uint)sum;
@@ -82,34 +99,29 @@ inline uint sub_mod(uint a, uint b, uint modulus) {
     return a >= b ? a - b : modulus - (b - a);
 }
 
-inline ulong reduce_pseudo_mersenne_once(ulong x, uint c) {
-    return (x & (ulong)PSEUDO_MERSENNE_MASK) + (x >> 31) * (ulong)c;
-}
-
-inline uint reduce_pseudo_mersenne(ulong x, uint modulus, uint c) {
-    while ((x >> 31) != 0) {
-        x = reduce_pseudo_mersenne_once(x, c);
-    }
-
-    uint reduced = (uint)x;
-    if (reduced >= modulus) {
-        reduced -= modulus;
-    }
-    if (reduced >= modulus) {
-        reduced -= modulus;
-    }
-    return reduced;
-}
-
-inline uint mul_mod(uint a, uint b, uint field_kind, uint modulus) {
-    ulong product = (ulong)a * (ulong)b;
+inline uint monty_mu(uint field_kind) {
     if (field_kind == FIELD_KIND_BABY_BEAR) {
-        return reduce_pseudo_mersenne(product, modulus, BABY_BEAR_C);
+        return BABY_BEAR_MONTY_MU;
     }
     if (field_kind == FIELD_KIND_KOALA_BEAR) {
-        return reduce_pseudo_mersenne(product, modulus, KOALA_BEAR_C);
+        return KOALA_BEAR_MONTY_MU;
     }
-    return (uint)(product % (ulong)modulus);
+    return 0;
+}
+
+inline uint monty_reduce(ulong x, uint modulus, uint monty_mu) {
+    uint t = (uint)x * monty_mu;
+    ulong u = (ulong)t * (ulong)modulus;
+    bool underflow = x < u;
+    ulong x_sub_u = x - u;
+    uint x_sub_u_hi = (uint)(x_sub_u >> 32);
+    uint corr = underflow ? modulus : 0;
+    return x_sub_u_hi + corr;
+}
+
+inline uint mul_monty(uint a, uint b, uint field_kind, uint modulus) {
+    ulong product = (ulong)a * (ulong)b;
+    return monty_reduce(product, modulus, monty_mu(field_kind));
 }
 
 kernel void base_field_dft_stage(
@@ -130,7 +142,7 @@ kernel void base_field_dft_stage(
     uint a = input[lo];
     uint b = input[hi];
     uint twiddle = twiddles[offset_in_block];
-    uint product = mul_mod(b, twiddle, params.field_kind, params.modulus);
+    uint product = mul_monty(b, twiddle, params.field_kind, params.modulus);
 
     output[lo] = add_mod(a, product, params.modulus);
     output[hi] = sub_mod(a, product, params.modulus);
@@ -179,7 +191,7 @@ kernel void base_field_dft_prefix(
         uint twiddle = twiddles[twiddle_offset + offset_in_block];
         uint a = tile[lo];
         uint b = tile[hi];
-        uint product = mul_mod(b, twiddle, params.field_kind, params.modulus);
+        uint product = mul_monty(b, twiddle, params.field_kind, params.modulus);
 
         tile[lo] = add_mod(a, product, params.modulus);
         tile[hi] = sub_mod(a, product, params.modulus);
@@ -190,12 +202,92 @@ kernel void base_field_dft_prefix(
     output[(global_base_row + row_lo) * params.width + column] = tile[tile_lo];
     output[(global_base_row + row_hi) * params.width + column] = tile[tile_hi];
 }
+
+kernel void base_field_dft_stage_pair(
+    device const uint* input [[buffer(0)]],
+    device uint* output [[buffer(1)]],
+    device const uint* twiddles [[buffer(2)]],
+    constant StagePairParams& params [[buffer(3)]],
+    uint local_tid [[thread_index_in_threadgroup]],
+    uint group_index [[threadgroup_position_in_grid]]
+) {
+    threadgroup uint tile[1024];
+
+    uint block_rows = params.half_size << 2;
+    uint pair_count = params.columns_per_group * (block_rows >> 1);
+    uint local_pair = local_tid / params.columns_per_group;
+    uint local_column = local_tid - local_pair * params.columns_per_group;
+    uint chunk_index = group_index % params.chunk_count;
+    uint block_index = group_index / params.chunk_count;
+    uint column = chunk_index * params.columns_per_group + local_column;
+    bool active = column < params.width;
+
+    uint row_lo = local_pair << 1;
+    uint row_hi = row_lo + 1;
+    uint global_base_row = block_index * block_rows;
+    uint tile_lo = row_lo * params.columns_per_group + local_column;
+    uint tile_hi = row_hi * params.columns_per_group + local_column;
+
+    if (active) {
+        tile[tile_lo] = input[(global_base_row + row_lo) * params.width + column];
+        tile[tile_hi] = input[(global_base_row + row_hi) * params.width + column];
+    } else {
+        tile[tile_lo] = 0;
+        tile[tile_hi] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint stage0_half_size = params.half_size;
+    uint stage0_span = stage0_half_size << 1;
+    uint stage0_offset = local_pair % stage0_half_size;
+    uint stage0_block = local_pair / stage0_half_size;
+    uint stage0_row = stage0_block * stage0_span + stage0_offset;
+    uint stage0_lo = stage0_row * params.columns_per_group + local_column;
+    uint stage0_hi = stage0_lo + stage0_half_size * params.columns_per_group;
+    uint stage0_twiddle = twiddles[stage0_offset];
+    uint stage0_a = tile[stage0_lo];
+    uint stage0_b = tile[stage0_hi];
+    uint stage0_product = mul_monty(
+        stage0_b,
+        stage0_twiddle,
+        params.field_kind,
+        params.modulus
+    );
+
+    tile[stage0_lo] = add_mod(stage0_a, stage0_product, params.modulus);
+    tile[stage0_hi] = sub_mod(stage0_a, stage0_product, params.modulus);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint stage1_half_size = stage0_half_size << 1;
+    uint stage1_lo = local_pair * params.columns_per_group + local_column;
+    uint stage1_hi = stage1_lo + stage1_half_size * params.columns_per_group;
+    uint stage1_twiddle = twiddles[stage0_half_size + local_pair];
+    uint stage1_a = tile[stage1_lo];
+    uint stage1_b = tile[stage1_hi];
+    uint stage1_product = mul_monty(
+        stage1_b,
+        stage1_twiddle,
+        params.field_kind,
+        params.modulus
+    );
+
+    tile[stage1_lo] = add_mod(stage1_a, stage1_product, params.modulus);
+    tile[stage1_hi] = sub_mod(stage1_a, stage1_product, params.modulus);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (active) {
+        output[(global_base_row + row_lo) * params.width + column] = tile[tile_lo];
+        output[(global_base_row + row_hi) * params.width + column] = tile[tile_hi];
+    }
+}
 "#;
 
 #[cfg(target_os = "macos")]
 const METAL_BASE_FIELD_KERNEL_NAME: &str = "base_field_dft_stage";
 #[cfg(target_os = "macos")]
 const METAL_BASE_FIELD_PREFIX_KERNEL_NAME: &str = "base_field_dft_prefix";
+#[cfg(target_os = "macos")]
+const METAL_BASE_FIELD_STAGE_PAIR_KERNEL_NAME: &str = "base_field_dft_stage_pair";
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
@@ -220,6 +312,18 @@ struct MetalPrefixParams {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct MetalStagePairParams {
+    width: u32,
+    columns_per_group: u32,
+    chunk_count: u32,
+    half_size: u32,
+    field_kind: u32,
+    modulus: u32,
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct MetalPrimeFieldExecution {
     kind: MetalPrimeFieldKind,
@@ -235,8 +339,10 @@ struct MetalExecutor {
     queue: CommandQueue,
     stage_pipeline: ComputePipelineState,
     prefix_pipeline: ComputePipelineState,
+    stage_pair_pipeline: ComputePipelineState,
     threads_per_threadgroup: usize,
     prefix_threads_per_threadgroup: usize,
+    stage_pair_threads_per_threadgroup: usize,
     resources: MetalResourceCache,
 }
 
@@ -354,6 +460,22 @@ impl MetalPrimeFieldExecution {
         } else {
             tile_rows.ilog2() as usize
         }
+    }
+
+    #[must_use]
+    fn stage_pair_columns_per_group(
+        &self,
+        stage: usize,
+        stage_pair_threads_per_threadgroup: usize,
+    ) -> usize {
+        let block_rows = 1usize << (stage + 2);
+        let max_tile_elements = MAX_THREADGROUP_TILE_ELEMENTS
+            .min(stage_pair_threads_per_threadgroup.saturating_mul(2).max(2));
+        if block_rows == 0 || block_rows > self.fft_size || block_rows > max_tile_elements {
+            return 0;
+        }
+
+        self.width.min(max_tile_elements / block_rows)
     }
 }
 
@@ -752,20 +874,30 @@ impl MetalExecutor {
         let prefix_pipeline = device
             .new_compute_pipeline_state_with_function(&prefix_function)
             .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+        let stage_pair_function = library
+            .get_function(METAL_BASE_FIELD_STAGE_PAIR_KERNEL_NAME, None)
+            .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+        let stage_pair_pipeline = device
+            .new_compute_pipeline_state_with_function(&stage_pair_function)
+            .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
         let threads_per_threadgroup = stage_pipeline
             .thread_execution_width()
             .min(stage_pipeline.max_total_threads_per_threadgroup())
             .min(THREADS_PER_THREADGROUP as u64) as usize;
         let prefix_threads_per_threadgroup =
             prefix_pipeline.max_total_threads_per_threadgroup() as usize;
+        let stage_pair_threads_per_threadgroup =
+            stage_pair_pipeline.max_total_threads_per_threadgroup() as usize;
 
         Ok(Self {
             device,
             queue,
             stage_pipeline,
             prefix_pipeline,
+            stage_pair_pipeline,
             threads_per_threadgroup,
             prefix_threads_per_threadgroup,
+            stage_pair_threads_per_threadgroup,
             resources: MetalResourceCache::default(),
         })
     }
@@ -842,11 +974,66 @@ fn dispatch_prime_field_fft(
         dst_buffer = work_b_buffer.clone();
     }
 
-    encoder.set_compute_pipeline_state(&executor.stage_pipeline);
     let butterfly_count = execution.width * (execution.fft_size / 2);
     let threads_per_threadgroup = executor.threads_per_threadgroup.min(butterfly_count.max(1));
+    let log_fft_size = execution.fft_size.ilog2() as usize;
+    let mut stage = prefix_stage_count;
 
-    for stage in prefix_stage_count..execution.fft_size.ilog2() as usize {
+    while stage < log_fft_size {
+        let stage_pair_columns_per_group = if stage + 1 < log_fft_size {
+            execution
+                .stage_pair_columns_per_group(stage, executor.stage_pair_threads_per_threadgroup)
+        } else {
+            0
+        };
+
+        if stage_pair_columns_per_group > 0 {
+            let half_size = 1usize << stage;
+            let block_rows = half_size << 2;
+            let block_count = execution.fft_size / block_rows;
+            let chunk_count = execution.width.div_ceil(stage_pair_columns_per_group);
+            let pair_count = stage_pair_columns_per_group * (block_rows / 2);
+            let stage_pair_params = MetalStagePairParams {
+                width: execution.width as u32,
+                columns_per_group: stage_pair_columns_per_group as u32,
+                chunk_count: chunk_count as u32,
+                half_size: half_size as u32,
+                field_kind: execution.field_kind_u32(),
+                modulus: execution.modulus,
+            };
+
+            encoder.set_compute_pipeline_state(&executor.stage_pair_pipeline);
+            encoder.set_buffer(0, Some(&src_buffer), 0);
+            encoder.set_buffer(1, Some(&dst_buffer), 0);
+            encoder.set_buffer(
+                2,
+                Some(twiddle_buffer),
+                (twiddle_offset * size_of::<u32>()) as u64,
+            );
+            encoder.set_bytes(
+                3,
+                size_of::<MetalStagePairParams>() as u64,
+                (&stage_pair_params as *const MetalStagePairParams).cast::<c_void>(),
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: (block_count * chunk_count) as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: pair_count as u64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+
+            twiddle_offset += half_size + (half_size << 1);
+            stage += 2;
+            core::mem::swap(&mut src_buffer, &mut dst_buffer);
+            continue;
+        }
+
         let half_size = 1usize << stage;
         let stage_params = MetalStageParams {
             width: execution.width as u32,
@@ -856,6 +1043,7 @@ fn dispatch_prime_field_fft(
             modulus: execution.modulus,
         };
 
+        encoder.set_compute_pipeline_state(&executor.stage_pipeline);
         encoder.set_buffer(0, Some(&src_buffer), 0);
         encoder.set_buffer(1, Some(&dst_buffer), 0);
         encoder.set_buffer(
@@ -882,6 +1070,7 @@ fn dispatch_prime_field_fft(
         );
 
         twiddle_offset += half_size;
+        stage += 1;
         core::mem::swap(&mut src_buffer, &mut dst_buffer);
     }
 
@@ -932,29 +1121,38 @@ fn execute_prime_field_fft(
 }
 
 #[cfg(target_os = "macos")]
-fn try_prepare_prime_field_execution<F>(padded: &DenseMatrix<F>) -> Option<MetalPrimeFieldExecution>
+fn try_prepare_prime_field_execution_for_dims<F>(
+    width: usize,
+    fft_size: usize,
+) -> Option<MetalPrimeFieldExecution>
 where
     F: TwoAdicField,
 {
     if TypeId::of::<F>() == TypeId::of::<BabyBear>() {
-        let _ = unsafe { cast_field_slice::<F, BabyBear>(&padded.values) };
         return Some(build_prime_field_execution::<BabyBear>(
             MetalPrimeFieldKind::BabyBear,
-            padded.width(),
-            padded.height(),
+            width,
+            fft_size,
         ));
     }
 
     if TypeId::of::<F>() == TypeId::of::<KoalaBear>() {
-        let _ = unsafe { cast_field_slice::<F, KoalaBear>(&padded.values) };
         return Some(build_prime_field_execution::<KoalaBear>(
             MetalPrimeFieldKind::KoalaBear,
-            padded.width(),
-            padded.height(),
+            width,
+            fft_size,
         ));
     }
 
     None
+}
+
+#[cfg(target_os = "macos")]
+fn try_prepare_prime_field_execution<F>(padded: &DenseMatrix<F>) -> Option<MetalPrimeFieldExecution>
+where
+    F: TwoAdicField,
+{
+    try_prepare_prime_field_execution_for_dims::<F>(padded.width(), padded.height())
 }
 
 #[cfg(target_os = "macos")]
@@ -986,7 +1184,7 @@ where
             F::two_adic_generator(stage + 1)
                 .powers()
                 .take(half_size)
-                .map(|twiddle| twiddle.as_canonical_u32()),
+                .map(|twiddle| twiddle.to_unique_u32()),
         );
     }
     twiddles
@@ -1019,6 +1217,86 @@ const fn bit_reverse_index(index: usize, log_n: u32) -> usize {
 }
 
 #[cfg(target_os = "macos")]
+#[inline]
+const fn logical_row_index(dst_row: usize, padded_height: usize, use_natural_order: bool) -> usize {
+    if use_natural_order {
+        dst_row
+    } else {
+        bit_reverse_index(dst_row, padded_height.ilog2())
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn buffer_u32_slice_mut<'a>(buffer: &'a Buffer, len: usize) -> &'a mut [u32] {
+    // SAFETY: callers guarantee that `buffer` stores at least `len` contiguous `u32` values.
+    unsafe { slice::from_raw_parts_mut(buffer.contents().cast::<u32>(), len) }
+}
+
+#[cfg(target_os = "macos")]
+fn serialize_prime_field_evals_to_words<F>(
+    values: &[F],
+    layout: DftBatchLayout,
+    use_natural_order: bool,
+    output: &mut [u32],
+) where
+    F: PrimeField32,
+{
+    debug_assert_eq!(values.len(), layout.batch_count * layout.base_height);
+    debug_assert_eq!(output.len(), layout.batch_count * layout.padded_height);
+
+    output.fill(0);
+    for dst_row in 0..layout.padded_height {
+        let src_row = logical_row_index(dst_row, layout.padded_height, use_natural_order);
+        if src_row >= layout.base_height {
+            continue;
+        }
+
+        let dst_start = dst_row * layout.batch_count;
+        for column in 0..layout.batch_count {
+            output[dst_start + column] =
+                values[column * layout.base_height + src_row].to_unique_u32();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn serialize_extension_field_evals_to_words_with_repr<F, EF, T>(
+    values: &[EF],
+    layout: DftBatchLayout,
+    use_natural_order: bool,
+    output: &mut [u32],
+) where
+    F: TwoAdicField,
+    EF: ExtensionField<F>,
+    T: PrimeField32 + 'static,
+{
+    let width = layout.batch_count * EF::DIMENSION;
+    debug_assert_eq!(values.len(), layout.batch_count * layout.base_height);
+    debug_assert_eq!(output.len(), width * layout.padded_height);
+
+    output.fill(0);
+    for dst_row in 0..layout.padded_height {
+        let src_row = logical_row_index(dst_row, layout.padded_height, use_natural_order);
+        if src_row >= layout.base_height {
+            continue;
+        }
+
+        let dst_start = dst_row * width;
+        for column in 0..layout.batch_count {
+            let coeffs = unsafe {
+                cast_field_slice::<F, T>(
+                    values[column * layout.base_height + src_row].as_basis_coefficients_slice(),
+                )
+            };
+            let coeff_start = dst_start + column * EF::DIMENSION;
+            for (idx, coeff) in coeffs.iter().enumerate() {
+                output[coeff_start + idx] = coeff.to_unique_u32();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 unsafe fn write_prime_field_matrix_to_buffer<F>(
     values: &[F],
     width: usize,
@@ -1039,7 +1317,7 @@ unsafe fn write_prime_field_matrix_to_buffer<F>(
             unsafe {
                 encoded
                     .add(dst_start + column)
-                    .write(values[src_start + column].as_canonical_u32())
+                    .write(values[src_start + column].to_unique_u32())
             };
         }
     }
@@ -1053,8 +1331,71 @@ where
     let encoded = buffer.contents().cast::<u32>();
     for (idx, value) in values.iter().enumerate() {
         // SAFETY: caller provides a buffer with room for `values.len()` u32 values.
-        unsafe { encoded.add(idx).write(value.as_canonical_u32()) };
+        unsafe { encoded.add(idx).write(value.to_unique_u32()) };
     }
+}
+
+#[cfg(target_os = "macos")]
+fn write_supported_prime_field_evals_input<F>(
+    evals: &[F],
+    layout: DftBatchLayout,
+    use_natural_order: bool,
+    buffer: &Buffer,
+) -> bool
+where
+    F: TwoAdicField,
+{
+    let len = layout.batch_count * layout.padded_height;
+    let encoded = unsafe { buffer_u32_slice_mut(buffer, len) };
+    if TypeId::of::<F>() == TypeId::of::<BabyBear>() {
+        let values = unsafe { cast_field_slice::<F, BabyBear>(evals) };
+        serialize_prime_field_evals_to_words(values, layout, use_natural_order, encoded);
+        return true;
+    }
+
+    if TypeId::of::<F>() == TypeId::of::<KoalaBear>() {
+        let values = unsafe { cast_field_slice::<F, KoalaBear>(evals) };
+        serialize_prime_field_evals_to_words(values, layout, use_natural_order, encoded);
+        return true;
+    }
+
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn write_supported_extension_field_evals_input<F, EF>(
+    evals: &[EF],
+    layout: DftBatchLayout,
+    use_natural_order: bool,
+    buffer: &Buffer,
+) -> bool
+where
+    F: TwoAdicField,
+    EF: ExtensionField<F>,
+{
+    let width = layout.batch_count * EF::DIMENSION;
+    let encoded = unsafe { buffer_u32_slice_mut(buffer, width * layout.padded_height) };
+    if TypeId::of::<F>() == TypeId::of::<BabyBear>() {
+        serialize_extension_field_evals_to_words_with_repr::<F, EF, BabyBear>(
+            evals,
+            layout,
+            use_natural_order,
+            encoded,
+        );
+        return true;
+    }
+
+    if TypeId::of::<F>() == TypeId::of::<KoalaBear>() {
+        serialize_extension_field_evals_to_words_with_repr::<F, EF, KoalaBear>(
+            evals,
+            layout,
+            use_natural_order,
+            encoded,
+        );
+        return true;
+    }
+
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -1129,13 +1470,41 @@ fn gpu_dispatch_count() -> usize {
 }
 
 #[cfg(target_os = "macos")]
-fn decode_prime_field_output<F>(buffer: &Buffer, len: usize) -> Vec<F>
+unsafe fn reinterpret_u32_vec_as_field<F>(words: Vec<u32>) -> Vec<F>
+where
+    F: 'static,
+{
+    debug_assert_eq!(size_of::<F>(), size_of::<u32>());
+    debug_assert_eq!(align_of::<F>(), align_of::<u32>());
+    let (ptr, len, cap) = words.into_raw_parts();
+    // SAFETY: callers guarantee that `F` is a supported `repr(transparent)` wrapper
+    // around a single `u32` Montgomery word.
+    unsafe { Vec::from_raw_parts(ptr.cast::<F>(), len, cap) }
+}
+
+#[cfg(target_os = "macos")]
+fn decode_supported_prime_field_words<F>(words: &[u32]) -> Option<Vec<F>>
+where
+    F: TwoAdicField + 'static,
+{
+    if TypeId::of::<F>() == TypeId::of::<BabyBear>()
+        || TypeId::of::<F>() == TypeId::of::<KoalaBear>()
+    {
+        // Supported Metal fields are stored as a single Montgomery `u32` word.
+        return Some(unsafe { reinterpret_u32_vec_as_field(words.to_vec()) });
+    }
+
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn decode_prime_field_output<F>(buffer: &Buffer, len: usize) -> Option<Vec<F>>
 where
     F: TwoAdicField,
 {
     let output_ptr = buffer.contents().cast::<u32>();
     let output = unsafe { slice::from_raw_parts(output_ptr, len) };
-    output.iter().copied().map(F::from_u32).collect()
+    decode_supported_prime_field_words(output)
 }
 
 #[inline]
@@ -1194,10 +1563,14 @@ where
             );
         })
     }) {
-        Ok(output_buffer) => DenseMatrix::new(
-            decode_prime_field_output(&output_buffer, execution.width * execution.fft_size),
-            execution.width,
-        ),
+        Ok(output_buffer) => {
+            let Some(values) =
+                decode_prime_field_output(&output_buffer, execution.width * execution.fft_size)
+            else {
+                return run_base_dft_cpu(dft, padded);
+            };
+            DenseMatrix::new(values, execution.width)
+        }
         Err(_) => run_base_dft_cpu(dft, padded),
     }
 }
@@ -1300,6 +1673,121 @@ fn prepare_metal_submission(
 /// Supported 32-bit base fields run through the staged Metal kernel path; all
 /// other cases fall back to the CPU DFT implementation.
 #[inline]
+pub(super) fn run_base_dft_from_evals<F, Dft>(
+    dft: &Dft,
+    evals: &[F],
+    layout: DftBatchLayout,
+) -> DenseMatrix<F>
+where
+    F: TwoAdicField,
+    Dft: TwoAdicSubgroupDft<F>,
+{
+    debug_assert_eq!(evals.len(), layout.batch_count * layout.base_height);
+    let Some(execution) =
+        try_prepare_prime_field_execution_for_dims::<F>(layout.batch_count, layout.padded_height)
+    else {
+        return run_base_dft_cpu(dft, reshape_transpose_pad(evals, layout));
+    };
+
+    match with_metal_executor(|executor| {
+        execute_prime_field_fft(executor, &execution, |input_buffer, use_natural_order| {
+            let wrote_input = write_supported_prime_field_evals_input(
+                evals,
+                layout,
+                use_natural_order,
+                input_buffer,
+            );
+            debug_assert!(
+                wrote_input,
+                "supported field required for Metal input encoding"
+            );
+            if wrote_input {
+                input_buffer.did_modify_range(NSRange::new(
+                    0,
+                    (execution.input_len() * size_of::<u32>()) as u64,
+                ));
+            }
+        })
+    }) {
+        Ok(output_buffer) => {
+            let Some(values) = decode_prime_field_output(&output_buffer, execution.input_len())
+            else {
+                return run_base_dft_cpu(dft, reshape_transpose_pad(evals, layout));
+            };
+            DenseMatrix::new(values, layout.batch_count)
+        }
+        Err(_) => run_base_dft_cpu(dft, reshape_transpose_pad(evals, layout)),
+    }
+}
+
+#[inline]
+pub(super) fn run_ext_dft_from_evals<F, EF, Dft>(
+    dft: &Dft,
+    evals: &[EF],
+    layout: DftBatchLayout,
+) -> DenseMatrix<EF>
+where
+    F: TwoAdicField,
+    EF: ExtensionField<F> + TwoAdicField,
+    Dft: TwoAdicSubgroupDft<F>,
+{
+    debug_assert_eq!(evals.len(), layout.batch_count * layout.base_height);
+    let flattened_width = layout.batch_count * EF::DIMENSION;
+    let Some(execution) =
+        try_prepare_prime_field_execution_for_dims::<F>(flattened_width, layout.padded_height)
+    else {
+        let base_padded = reshape_transpose_pad_ext_to_base::<F, EF>(evals, layout);
+        let base_output = run_base_dft_cpu(dft, base_padded);
+        return DenseMatrix::new(
+            EF::reconstitute_from_base(base_output.values),
+            layout.batch_count,
+        );
+    };
+
+    match with_metal_executor(|executor| {
+        execute_prime_field_fft(executor, &execution, |input_buffer, use_natural_order| {
+            let wrote_input = write_supported_extension_field_evals_input::<F, EF>(
+                evals,
+                layout,
+                use_natural_order,
+                input_buffer,
+            );
+            debug_assert!(
+                wrote_input,
+                "supported field required for Metal input encoding"
+            );
+            if wrote_input {
+                input_buffer.did_modify_range(NSRange::new(
+                    0,
+                    (execution.input_len() * size_of::<u32>()) as u64,
+                ));
+            }
+        })
+    }) {
+        Ok(output_buffer) => {
+            let Some(values) = decode_prime_field_output(&output_buffer, execution.input_len())
+            else {
+                let base_padded = reshape_transpose_pad_ext_to_base::<F, EF>(evals, layout);
+                let base_output = run_base_dft_cpu(dft, base_padded);
+                return DenseMatrix::new(
+                    EF::reconstitute_from_base(base_output.values),
+                    layout.batch_count,
+                );
+            };
+            DenseMatrix::new(EF::reconstitute_from_base(values), layout.batch_count)
+        }
+        Err(_) => {
+            let base_padded = reshape_transpose_pad_ext_to_base::<F, EF>(evals, layout);
+            let base_output = run_base_dft_cpu(dft, base_padded);
+            DenseMatrix::new(
+                EF::reconstitute_from_base(base_output.values),
+                layout.batch_count,
+            )
+        }
+    }
+}
+
+#[inline]
 pub(super) fn run_base_dft<F, Dft>(
     dft: &Dft,
     padded: DenseMatrix<F>,
@@ -1332,6 +1820,7 @@ mod tests {
     use p3_goldilocks::Goldilocks;
     use p3_koala_bear::KoalaBear;
     use p3_matrix::dense::DenseMatrix;
+    use std::vec::Vec;
 
     use super::{
         MetalApi, MetalBufferLayout, MetalDeviceContext, MetalDiscoveryError, MetalDispatch,
@@ -1487,6 +1976,68 @@ mod tests {
         let plan = MetalExecutionPlan::from_job(job);
         let twiddles = super::stage_twiddles::<BabyBear>(job.fft_size);
         assert_eq!(twiddles.len(), plan.twiddle_count);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stage_twiddles_use_montgomery_words() {
+        let fft_size = 8;
+        let twiddles = super::stage_twiddles::<BabyBear>(fft_size);
+        let expected_monty: Vec<u32> = (0..fft_size.ilog2() as usize)
+            .flat_map(|stage| {
+                let half_size = 1usize << stage;
+                BabyBear::two_adic_generator(stage + 1)
+                    .powers()
+                    .take(half_size)
+                    .map(|twiddle| twiddle.to_unique_u32())
+            })
+            .collect();
+        let canonical: Vec<u32> = (0..fft_size.ilog2() as usize)
+            .flat_map(|stage| {
+                let half_size = 1usize << stage;
+                BabyBear::two_adic_generator(stage + 1)
+                    .powers()
+                    .take(half_size)
+                    .map(|twiddle| twiddle.as_canonical_u32())
+            })
+            .collect();
+
+        assert_eq!(twiddles, expected_monty);
+        assert_ne!(
+            twiddles, canonical,
+            "twiddles should stay in Montgomery form on the GPU boundary"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decode_supported_prime_field_words_round_trips_baby_bear_monty_words() {
+        let values: Vec<BabyBear> = (1_u32..=16).map(BabyBear::from_u32).collect();
+        let words: Vec<u32> = values.iter().map(|value| value.to_unique_u32()).collect();
+
+        let decoded = super::decode_supported_prime_field_words::<BabyBear>(&words)
+            .expect("BabyBear Montgomery words should decode");
+
+        assert_eq!(decoded, values);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decode_supported_prime_field_words_round_trips_koala_bear_monty_words() {
+        let values: Vec<KoalaBear> = (1_u32..=16).map(KoalaBear::from_u32).collect();
+        let words: Vec<u32> = values.iter().map(|value| value.to_unique_u32()).collect();
+
+        let decoded = super::decode_supported_prime_field_words::<KoalaBear>(&words)
+            .expect("KoalaBear Montgomery words should decode");
+
+        assert_eq!(decoded, values);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decode_supported_prime_field_words_rejects_unsupported_fields() {
+        let words = [1_u32, 2, 3, 4].to_vec();
+        assert!(super::decode_supported_prime_field_words::<Goldilocks>(&words).is_none());
     }
 
     #[test]
