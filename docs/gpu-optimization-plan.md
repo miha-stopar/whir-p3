@@ -368,12 +368,30 @@ Interpretation:
   - `element_count` = total matrix elements uploaded to the device
 - Backend paths are split:
   - `gpu-metal` feature for Metal path
+  - `gpu-wgsl` feature for WGSL/WGPU path
   - `gpu-vulkan` feature for Vulkan path
 - The Metal base-field DFT path now has a real compute dispatch for supported fields, with CPU fallback when Metal is unavailable or the field is unsupported.
+- The WGSL base-field DFT path mirrors the same Montgomery-resident arithmetic and twiddle layout as Metal, but runs through `wgpu` with WGSL shaders and explicit readback staging.
 
 Build matrix currently validated:
 
 - `cargo check`
 - `cargo check --features gpu-metal`
+- `cargo check --features gpu-wgsl`
 - `cargo check --features gpu-vulkan`
+- `cargo check --features "gpu-metal,gpu-wgsl"`
 - `cargo check --features "gpu-metal,gpu-vulkan"`
+
+WGSL comparison commands:
+
+- `cargo bench --bench dft --features "gpu-metal,gpu-wgsl"`
+- `cargo bench --bench whir --features "gpu-metal,gpu-wgsl"`
+
+Current WGSL memory model:
+
+- Input, scratch, and output all live in reusable `wgpu` storage buffers.
+- Results are copied into a reusable `MAP_READ | COPY_DST` staging buffer before host decode.
+- Twiddle buffers are cached per `(field, fft_size, modulus)` shape, matching the Metal cache strategy.
+- Host-side input words are also reused across calls to avoid re-allocating a fresh `Vec<u32>` for every dispatch.
+
+Relative to the current `stwo` examples, this repo now uses the same storage-buffer plus staging-buffer pattern, but keeps a longer-lived executor and reusable buffers instead of recreating them per computation.

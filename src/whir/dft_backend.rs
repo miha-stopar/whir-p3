@@ -4,6 +4,7 @@
 //! CPU remains the source of truth. The optional `gpu` feature currently routes
 //! through a GPU hook that falls back to CPU until kernels are implemented.
 
+use core::sync::atomic::{AtomicU8, Ordering};
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::{ExtensionField, Field, TwoAdicField};
 use p3_matrix::{
@@ -18,22 +19,51 @@ use crate::whir::dft_layout::DftBatchLayout;
 mod metal;
 #[cfg(feature = "gpu-vulkan")]
 mod vulkan;
+#[cfg(feature = "gpu-wgsl")]
+mod wgsl;
+
+const DFT_BACKEND_AUTO: u8 = 0;
+const DFT_BACKEND_CPU: u8 = 1;
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+const DFT_BACKEND_METAL: u8 = 2;
+#[cfg(feature = "gpu-wgsl")]
+const DFT_BACKEND_WGSL: u8 = 3;
+#[cfg(feature = "gpu-vulkan")]
+const DFT_BACKEND_VULKAN: u8 = 4;
+
+static DFT_BACKEND_OVERRIDE: AtomicU8 = AtomicU8::new(DFT_BACKEND_AUTO);
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DftBackend {
+pub(crate) enum DftBackend {
     Cpu,
     #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
     Metal,
+    #[cfg(feature = "gpu-wgsl")]
+    Wgsl,
     #[cfg(feature = "gpu-vulkan")]
     Vulkan,
 }
 
 #[inline]
 fn selected_backend() -> DftBackend {
+    if let Some(backend) = requested_backend_override() {
+        return select_available_backend(backend);
+    }
+
+    select_available_backend_auto()
+}
+
+#[inline]
+fn select_available_backend_auto() -> DftBackend {
     #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
     if metal::is_available() {
         return DftBackend::Metal;
+    }
+
+    #[cfg(feature = "gpu-wgsl")]
+    if wgsl::is_available() {
+        return DftBackend::Wgsl;
     }
 
     #[cfg(feature = "gpu-vulkan")]
@@ -42,6 +72,71 @@ fn selected_backend() -> DftBackend {
     }
 
     DftBackend::Cpu
+}
+
+#[inline]
+fn select_available_backend(requested: DftBackend) -> DftBackend {
+    if backend_is_available(requested) {
+        requested
+    } else {
+        DftBackend::Cpu
+    }
+}
+
+#[inline]
+fn requested_backend_override() -> Option<DftBackend> {
+    match DFT_BACKEND_OVERRIDE.load(Ordering::Relaxed) {
+        DFT_BACKEND_AUTO => None,
+        DFT_BACKEND_CPU => Some(DftBackend::Cpu),
+        #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+        DFT_BACKEND_METAL => Some(DftBackend::Metal),
+        #[cfg(feature = "gpu-wgsl")]
+        DFT_BACKEND_WGSL => Some(DftBackend::Wgsl),
+        #[cfg(feature = "gpu-vulkan")]
+        DFT_BACKEND_VULKAN => Some(DftBackend::Vulkan),
+        _ => None,
+    }
+}
+
+#[inline]
+const fn backend_override_tag(backend: DftBackend) -> u8 {
+    match backend {
+        DftBackend::Cpu => DFT_BACKEND_CPU,
+        #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+        DftBackend::Metal => DFT_BACKEND_METAL,
+        #[cfg(feature = "gpu-wgsl")]
+        DftBackend::Wgsl => DFT_BACKEND_WGSL,
+        #[cfg(feature = "gpu-vulkan")]
+        DftBackend::Vulkan => DFT_BACKEND_VULKAN,
+    }
+}
+
+#[inline]
+fn backend_is_available(backend: DftBackend) -> bool {
+    match backend {
+        DftBackend::Cpu => true,
+        #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+        DftBackend::Metal => metal::is_available(),
+        #[cfg(feature = "gpu-wgsl")]
+        DftBackend::Wgsl => wgsl::is_available(),
+        #[cfg(feature = "gpu-vulkan")]
+        DftBackend::Vulkan => vulkan::is_available(),
+    }
+}
+
+struct BackendOverrideRestore(u8);
+
+impl Drop for BackendOverrideRestore {
+    fn drop(&mut self) {
+        DFT_BACKEND_OVERRIDE.store(self.0, Ordering::Relaxed);
+    }
+}
+
+#[doc(hidden)]
+pub(crate) fn with_explicit_backend_override<R>(backend: DftBackend, f: impl FnOnce() -> R) -> R {
+    let previous = DFT_BACKEND_OVERRIDE.swap(backend_override_tag(backend), Ordering::Relaxed);
+    let _restore = BackendOverrideRestore(previous);
+    f()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +196,8 @@ pub(crate) fn selected_backend_name() -> &'static str {
         DftBackend::Cpu => "cpu",
         #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
         DftBackend::Metal => "metal",
+        #[cfg(feature = "gpu-wgsl")]
+        DftBackend::Wgsl => "wgsl",
         #[cfg(feature = "gpu-vulkan")]
         DftBackend::Vulkan => "vulkan",
     }
@@ -125,6 +222,8 @@ where
         }
         #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
         DftBackend::Metal => metal::run_base_dft_from_evals(dft, evals, layout),
+        #[cfg(feature = "gpu-wgsl")]
+        DftBackend::Wgsl => wgsl::run_base_dft_from_evals(dft, evals, layout),
         #[cfg(feature = "gpu-vulkan")]
         DftBackend::Vulkan => {
             let padded = reshape_transpose_pad(evals, layout);
@@ -161,6 +260,8 @@ where
         }
         #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
         DftBackend::Metal => return metal::run_ext_dft_from_evals(dft, evals, layout),
+        #[cfg(feature = "gpu-wgsl")]
+        DftBackend::Wgsl => return wgsl::run_ext_dft_from_evals(dft, evals, layout),
         #[cfg(feature = "gpu-vulkan")]
         DftBackend::Vulkan => {
             let base_padded = reshape_transpose_pad_ext_to_base(evals, layout);
@@ -239,10 +340,36 @@ where
     metal::run_base_dft(dft, padded, job)
 }
 
+#[cfg(feature = "gpu-wgsl")]
+#[inline]
+pub(super) fn run_padded_base_dft_explicit_wgsl<F, Dft>(
+    dft: &Dft,
+    padded: DenseMatrix<F>,
+) -> DenseMatrix<F>
+where
+    F: TwoAdicField,
+    Dft: TwoAdicSubgroupDft<F>,
+{
+    let job = GpuDftJob {
+        element_kind: DftElementKind::BaseField,
+        batch_count: padded.width(),
+        fft_size: padded.height(),
+        element_count: padded.width() * padded.height(),
+    };
+    debug_assert!(job.is_valid());
+    wgsl::run_base_dft(dft, padded, job)
+}
+
 #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
 #[must_use]
 pub(super) fn metal_is_available_for_bench() -> bool {
     metal::is_available()
+}
+
+#[cfg(feature = "gpu-wgsl")]
+#[must_use]
+pub(super) fn wgsl_is_available_for_bench() -> bool {
+    wgsl::is_available()
 }
 
 #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
@@ -296,7 +423,7 @@ mod tests {
     #[test]
     fn selected_backend_has_known_name() {
         let name = selected_backend_name();
-        assert!(matches!(name, "cpu" | "metal" | "vulkan"));
+        assert!(matches!(name, "cpu" | "metal" | "wgsl" | "vulkan"));
     }
 
     #[test]

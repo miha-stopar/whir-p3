@@ -1,6 +1,6 @@
 #![no_std]
 extern crate alloc;
-#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+#[cfg(any(all(feature = "gpu-metal", target_os = "macos"), feature = "gpu-wgsl"))]
 extern crate std;
 
 pub mod constant;

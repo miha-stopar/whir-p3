@@ -4,6 +4,8 @@ use p3_koala_bear::KoalaBear;
 use p3_matrix::dense::DenseMatrix;
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use std::time::Duration;
+#[cfg(feature = "gpu-wgsl")]
+use whir_p3::whir::bench_support::wgsl_available;
 use whir_p3::whir::bench_support::{BaseDftBenchmarkBackend, backend_name, run_padded_base_dft};
 #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
 use whir_p3::whir::bench_support::{
@@ -81,6 +83,19 @@ fn benchmark_padded_base_dft(c: &mut Criterion) {
         } else {
             std::eprintln!(
                 "gpu-metal enabled, but Metal is unavailable to this process; skipping metal DFT benchmarks"
+            );
+        }
+        backends
+    };
+
+    #[cfg(feature = "gpu-wgsl")]
+    let backends = {
+        let mut backends = backends;
+        if wgsl_available() {
+            backends.push(BaseDftBenchmarkBackend::Wgsl);
+        } else {
+            std::eprintln!(
+                "gpu-wgsl enabled, but WGPU/WGSL is unavailable to this process; skipping wgsl DFT benchmarks"
             );
         }
         backends

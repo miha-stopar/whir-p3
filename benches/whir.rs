@@ -5,6 +5,11 @@ use p3_field::extension::BinomialExtensionField;
 use p3_koala_bear::{KoalaBear, Poseidon2KoalaBear};
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
+#[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+use whir_p3::whir::bench_support::metal_available;
+#[cfg(feature = "gpu-wgsl")]
+use whir_p3::whir::bench_support::wgsl_available;
+use whir_p3::whir::bench_support::{BaseDftBenchmarkBackend, backend_name, with_benchmark_backend};
 use whir_p3::{
     fiat_shamir::domain_separator::DomainSeparator,
     parameters::{DEFAULT_MAX_POW, FoldingFactor, ProtocolParameters, errors::SecurityAssumption},
@@ -133,54 +138,80 @@ fn benchmark_commit_and_prove(c: &mut Criterion) {
     let (params, whir_params, num_variables, dft, initial_statement, challenger, domainsep) =
         prepare_inputs();
 
-    c.bench_function("commit", |b| {
-        b.iter(|| {
-            let mut challenger_clone = challenger.clone();
-            domainsep.observe_domain_separator(&mut challenger_clone);
-            let mut proof =
-                WhirProof::<F, EF, F, 8>::from_protocol_parameters(&whir_params, num_variables);
-            let committer = CommitmentWriter::new(&params);
-            let mut initial_statement = initial_statement.clone();
-            let _prover_data = committer
-                .commit::<_, <F as p3_field::Field>::Packing, F, <F as p3_field::Field>::Packing, 8>(
-                    &dft,
-                    &mut proof,
-                    &mut challenger_clone,
-                    &mut initial_statement,
-                )
-                .unwrap();
-        });
-    });
+    let mut backends = vec![BaseDftBenchmarkBackend::Cpu];
 
-    c.bench_function("prove", |b| {
-        b.iter(|| {
-            let mut challenger_clone = challenger.clone();
-            domainsep.observe_domain_separator(&mut challenger_clone);
-            let mut proof =
-                WhirProof::<F, EF, F, 8>::from_protocol_parameters(&whir_params, num_variables);
-            let committer = CommitmentWriter::new(&params);
-            let mut initial_statement = initial_statement.clone();
-            let prover_data = committer
-                .commit::<_, <F as p3_field::Field>::Packing, F, <F as p3_field::Field>::Packing, 8>(
-                    &dft,
-                    &mut proof,
-                    &mut challenger_clone,
-                    &mut initial_statement,
-                )
-                .unwrap();
+    #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
+    if metal_available() {
+        backends.push(BaseDftBenchmarkBackend::Metal);
+    } else {
+        std::eprintln!(
+            "gpu-metal enabled, but Metal is unavailable to this process; skipping metal WHIR benchmarks"
+        );
+    }
 
-            let prover = Prover(&params);
-            prover
-                .prove::<_, <F as p3_field::Field>::Packing, F, <F as p3_field::Field>::Packing, 8>(
-                    &dft,
-                    &mut proof,
-                    &mut challenger_clone,
-                    &initial_statement,
-                    prover_data,
-                )
-                .unwrap();
+    #[cfg(feature = "gpu-wgsl")]
+    if wgsl_available() {
+        backends.push(BaseDftBenchmarkBackend::Wgsl);
+    } else {
+        std::eprintln!(
+            "gpu-wgsl enabled, but WGPU/WGSL is unavailable to this process; skipping wgsl WHIR benchmarks"
+        );
+    }
+
+    for backend in backends {
+        c.bench_function(&format!("commit/{}", backend_name(backend)), |b| {
+            b.iter(|| {
+                with_benchmark_backend(backend, || {
+                    let mut challenger_clone = challenger.clone();
+                    domainsep.observe_domain_separator(&mut challenger_clone);
+                    let mut proof =
+                        WhirProof::<F, EF, F, 8>::from_protocol_parameters(&whir_params, num_variables);
+                    let committer = CommitmentWriter::new(&params);
+                    let mut initial_statement = initial_statement.clone();
+                    let _prover_data = committer
+                        .commit::<_, <F as p3_field::Field>::Packing, F, <F as p3_field::Field>::Packing, 8>(
+                            &dft,
+                            &mut proof,
+                            &mut challenger_clone,
+                            &mut initial_statement,
+                        )
+                        .unwrap();
+                });
+            });
         });
-    });
+
+        c.bench_function(&format!("prove/{}", backend_name(backend)), |b| {
+            b.iter(|| {
+                with_benchmark_backend(backend, || {
+                    let mut challenger_clone = challenger.clone();
+                    domainsep.observe_domain_separator(&mut challenger_clone);
+                    let mut proof =
+                        WhirProof::<F, EF, F, 8>::from_protocol_parameters(&whir_params, num_variables);
+                    let committer = CommitmentWriter::new(&params);
+                    let mut initial_statement = initial_statement.clone();
+                    let prover_data = committer
+                        .commit::<_, <F as p3_field::Field>::Packing, F, <F as p3_field::Field>::Packing, 8>(
+                            &dft,
+                            &mut proof,
+                            &mut challenger_clone,
+                            &mut initial_statement,
+                        )
+                        .unwrap();
+
+                    let prover = Prover(&params);
+                    prover
+                        .prove::<_, <F as p3_field::Field>::Packing, F, <F as p3_field::Field>::Packing, 8>(
+                            &dft,
+                            &mut proof,
+                            &mut challenger_clone,
+                            &initial_statement,
+                            prover_data,
+                        )
+                        .unwrap();
+                });
+            });
+        });
+    }
 }
 
 criterion_group!(benches, benchmark_commit_and_prove);
