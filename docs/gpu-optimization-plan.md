@@ -112,6 +112,31 @@ Success criteria:
 - >= 1.5x speedup on `bench whir` `commit`.
 - No proof/verifier divergence.
 
+### Phase 1 Experiment Note: Standalone GPU Prepare Pass
+
+On April 3, 2026, the branch briefly tested a Metal-only optimization that uploaded raw evals and
+then ran a separate GPU prepare kernel to transpose, zero-pad, and bit-reverse into FFT layout
+before launching the DFT kernels.
+
+Result:
+
+- This regressed the end-to-end `whir` benchmark on macOS/Metal and was reverted.
+- Benchmark command: `cargo bench --bench whir --features gpu-metal`
+- Observed `commit`: `611.08 ms .. 628.53 ms` with Criterion reporting `+65.596% .. +75.395%`
+- Observed `prove`: `1.7034 s .. 1.8125 s` with Criterion reporting `+56.592% .. +96.337%`
+
+Likely cause:
+
+- The design added an extra GPU pass and an extra synchronization boundary (`commit()` /
+  `wait_until_completed()`) before the FFT pass, which cost more than the removed CPU-side layout
+  preparation on this machine.
+
+Conclusion:
+
+- Do not keep a standalone Metal prepare kernel in front of the DFT path.
+- Only revisit GPU-side input preparation if it can be fused into the FFT submission path without
+  an extra pass/sync boundary.
+
 ### Phase 1 Context: What the DFT is doing in WHIR
 
 At commitment time and at every prover round, WHIR must re-encode the current folded polynomial
