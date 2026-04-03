@@ -90,6 +90,15 @@ struct StagePairParams {
     uint modulus;
 };
 
+struct PrepareInputParams {
+    uint input_width;
+    uint output_width;
+    uint base_height;
+    uint coeff_dim;
+    uint log_fft_size;
+    uint use_natural_order;
+};
+
 inline uint add_mod(uint a, uint b, uint modulus) {
     ulong sum = (ulong)a + (ulong)b;
     return sum >= (ulong)modulus ? (uint)(sum - (ulong)modulus) : (uint)sum;
@@ -122,6 +131,32 @@ inline uint monty_reduce(ulong x, uint modulus, uint monty_mu) {
 inline uint mul_monty(uint a, uint b, uint field_kind, uint modulus) {
     ulong product = (ulong)a * (ulong)b;
     return monty_reduce(product, modulus, monty_mu(field_kind));
+}
+
+// Convert raw uploaded evals into the FFT input layout expected by the staged
+// DFT kernels: transpose batches into columns, zero-pad to `fft_size`, and
+// optionally bit-reverse rows when the prefix kernel is not used.
+kernel void base_field_prepare_input(
+    device const uint* input [[buffer(0)]],
+    device uint* output [[buffer(1)]],
+    constant PrepareInputParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint dst_row = gid / params.output_width;
+    uint dst_col = gid - dst_row * params.output_width;
+    uint logical_row = params.use_natural_order != 0
+        ? dst_row
+        : (reverse_bits(dst_row) >> (32 - params.log_fft_size));
+
+    if (logical_row >= params.base_height) {
+        output[gid] = 0;
+        return;
+    }
+
+    uint batch = dst_col / params.coeff_dim;
+    uint coeff = dst_col - batch * params.coeff_dim;
+    uint src_index = batch * params.input_width + logical_row * params.coeff_dim + coeff;
+    output[gid] = input[src_index];
 }
 
 kernel void base_field_dft_stage(
@@ -288,6 +323,8 @@ const METAL_BASE_FIELD_KERNEL_NAME: &str = "base_field_dft_stage";
 const METAL_BASE_FIELD_PREFIX_KERNEL_NAME: &str = "base_field_dft_prefix";
 #[cfg(target_os = "macos")]
 const METAL_BASE_FIELD_STAGE_PAIR_KERNEL_NAME: &str = "base_field_dft_stage_pair";
+#[cfg(target_os = "macos")]
+const METAL_BASE_FIELD_PREPARE_KERNEL_NAME: &str = "base_field_prepare_input";
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
@@ -324,6 +361,18 @@ struct MetalStagePairParams {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct MetalPrepareInputParams {
+    input_width: u32,
+    output_width: u32,
+    base_height: u32,
+    coeff_dim: u32,
+    log_fft_size: u32,
+    use_natural_order: u32,
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct MetalPrimeFieldExecution {
     kind: MetalPrimeFieldKind,
@@ -337,9 +386,11 @@ struct MetalPrimeFieldExecution {
 struct MetalExecutor {
     device: Device,
     queue: CommandQueue,
+    prepare_pipeline: ComputePipelineState,
     stage_pipeline: ComputePipelineState,
     prefix_pipeline: ComputePipelineState,
     stage_pair_pipeline: ComputePipelineState,
+    prepare_threads_per_threadgroup: usize,
     threads_per_threadgroup: usize,
     prefix_threads_per_threadgroup: usize,
     stage_pair_threads_per_threadgroup: usize,
@@ -862,6 +913,12 @@ impl MetalExecutor {
         let library = device
             .new_library_with_source(METAL_BASE_FIELD_SHADER, &options)
             .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+        let prepare_function = library
+            .get_function(METAL_BASE_FIELD_PREPARE_KERNEL_NAME, None)
+            .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+        let prepare_pipeline = device
+            .new_compute_pipeline_state_with_function(&prepare_function)
+            .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
         let stage_function = library
             .get_function(METAL_BASE_FIELD_KERNEL_NAME, None)
             .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
@@ -880,6 +937,11 @@ impl MetalExecutor {
         let stage_pair_pipeline = device
             .new_compute_pipeline_state_with_function(&stage_pair_function)
             .map_err(|_| MetalDiscoveryError::MissingPipelines)?;
+        let prepare_threads_per_threadgroup = prepare_pipeline
+            .thread_execution_width()
+            .min(prepare_pipeline.max_total_threads_per_threadgroup())
+            .min(THREADS_PER_THREADGROUP as u64)
+            as usize;
         let threads_per_threadgroup = stage_pipeline
             .thread_execution_width()
             .min(stage_pipeline.max_total_threads_per_threadgroup())
@@ -892,9 +954,11 @@ impl MetalExecutor {
         Ok(Self {
             device,
             queue,
+            prepare_pipeline,
             stage_pipeline,
             prefix_pipeline,
             stage_pair_pipeline,
+            prepare_threads_per_threadgroup,
             threads_per_threadgroup,
             prefix_threads_per_threadgroup,
             stage_pair_threads_per_threadgroup,
@@ -917,6 +981,46 @@ fn with_metal_executor<R>(
         let executor = guard.as_mut().expect("executor initialized");
         f(executor)
     })
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_prepare_prime_field_input(
+    executor: &MetalExecutor,
+    source_buffer: &Buffer,
+    prepared_buffer: &Buffer,
+    params: MetalPrepareInputParams,
+    output_len: usize,
+) {
+    let command_buffer = executor.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    let threads_per_threadgroup = executor
+        .prepare_threads_per_threadgroup
+        .min(output_len.max(1));
+
+    encoder.set_compute_pipeline_state(&executor.prepare_pipeline);
+    encoder.set_buffer(0, Some(source_buffer), 0);
+    encoder.set_buffer(1, Some(prepared_buffer), 0);
+    encoder.set_bytes(
+        2,
+        size_of::<MetalPrepareInputParams>() as u64,
+        (&params as *const MetalPrepareInputParams).cast::<c_void>(),
+    );
+    encoder.dispatch_threads(
+        MTLSize {
+            width: output_len as u64,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: threads_per_threadgroup as u64,
+            height: 1,
+            depth: 1,
+        },
+    );
+
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
 }
 
 #[cfg(target_os = "macos")]
@@ -1121,6 +1225,65 @@ fn execute_prime_field_fft(
 }
 
 #[cfg(target_os = "macos")]
+fn execute_prime_field_fft_from_raw_input(
+    executor: &mut MetalExecutor,
+    execution: &MetalPrimeFieldExecution,
+    raw_input_len: usize,
+    raw_input_width: usize,
+    base_height: usize,
+    coeff_dim: usize,
+    write_raw_input: impl FnOnce(&Buffer) -> bool,
+) -> Result<Buffer, MetalDiscoveryError> {
+    let input_len = execution.input_len();
+    let buffer_len_bytes = (input_len * size_of::<u32>()) as u64;
+    let options = MTLResourceOptions::StorageModeShared;
+    let (source_buffer, work_a_buffer, work_b_buffer) =
+        executor
+            .resources
+            .execution_buffers(&executor.device, buffer_len_bytes, options)?;
+    let twiddle_key = MetalTwiddleKey {
+        kind: execution.kind,
+        fft_size: execution.fft_size,
+        modulus: execution.modulus,
+    };
+    let twiddle_buffer =
+        executor
+            .resources
+            .twiddle_buffer(&executor.device, twiddle_key, options)?;
+
+    if !write_raw_input(&source_buffer) {
+        return Err(MetalDiscoveryError::DeviceUnavailable);
+    }
+    source_buffer.did_modify_range(NSRange::new(0, (raw_input_len * size_of::<u32>()) as u64));
+    let use_natural_order =
+        execution.prefix_stage_count(executor.prefix_threads_per_threadgroup) > 0;
+    let prepare_params = MetalPrepareInputParams {
+        input_width: raw_input_width as u32,
+        output_width: execution.width as u32,
+        base_height: base_height as u32,
+        coeff_dim: coeff_dim as u32,
+        log_fft_size: execution.fft_size.ilog2(),
+        use_natural_order: u32::from(use_natural_order),
+    };
+    dispatch_prepare_prime_field_input(
+        executor,
+        &source_buffer,
+        &work_a_buffer,
+        prepare_params,
+        input_len,
+    );
+
+    Ok(dispatch_prime_field_fft(
+        executor,
+        execution,
+        &work_a_buffer,
+        &work_b_buffer,
+        &source_buffer,
+        &twiddle_buffer,
+    ))
+}
+
+#[cfg(target_os = "macos")]
 fn try_prepare_prime_field_execution_for_dims<F>(
     width: usize,
     fft_size: usize,
@@ -1217,81 +1380,42 @@ const fn bit_reverse_index(index: usize, log_n: u32) -> usize {
 }
 
 #[cfg(target_os = "macos")]
-#[inline]
-const fn logical_row_index(dst_row: usize, padded_height: usize, use_natural_order: bool) -> usize {
-    if use_natural_order {
-        dst_row
-    } else {
-        bit_reverse_index(dst_row, padded_height.ilog2())
-    }
-}
-
-#[cfg(target_os = "macos")]
 unsafe fn buffer_u32_slice_mut<'a>(buffer: &'a Buffer, len: usize) -> &'a mut [u32] {
     // SAFETY: callers guarantee that `buffer` stores at least `len` contiguous `u32` values.
     unsafe { slice::from_raw_parts_mut(buffer.contents().cast::<u32>(), len) }
 }
 
 #[cfg(target_os = "macos")]
-fn serialize_prime_field_evals_to_words<F>(
-    values: &[F],
-    layout: DftBatchLayout,
-    use_natural_order: bool,
-    output: &mut [u32],
-) where
+unsafe fn write_prime_field_raw_input_to_buffer<F>(values: &[F], buffer: &Buffer)
+where
     F: PrimeField32,
 {
-    debug_assert_eq!(values.len(), layout.batch_count * layout.base_height);
-    debug_assert_eq!(output.len(), layout.batch_count * layout.padded_height);
-
-    output.fill(0);
-    for dst_row in 0..layout.padded_height {
-        let src_row = logical_row_index(dst_row, layout.padded_height, use_natural_order);
-        if src_row >= layout.base_height {
-            continue;
-        }
-
-        let dst_start = dst_row * layout.batch_count;
-        for column in 0..layout.batch_count {
-            output[dst_start + column] =
-                values[column * layout.base_height + src_row].to_unique_u32();
-        }
+    let encoded = buffer.contents().cast::<u32>();
+    for (idx, value) in values.iter().enumerate() {
+        // Raw upload: preserve the original slice order. The prepare kernel will
+        // transpose, pad, and bit-reverse into FFT layout on the GPU.
+        // SAFETY: caller provides a buffer with room for `values.len()` u32 values.
+        unsafe { encoded.add(idx).write(value.to_unique_u32()) };
     }
 }
 
 #[cfg(target_os = "macos")]
-fn serialize_extension_field_evals_to_words_with_repr<F, EF, T>(
+fn write_flat_extension_field_raw_input_to_slice_with_repr<F, EF, T>(
     values: &[EF],
-    layout: DftBatchLayout,
-    use_natural_order: bool,
     output: &mut [u32],
 ) where
     F: TwoAdicField,
     EF: ExtensionField<F>,
     T: PrimeField32 + 'static,
 {
-    let width = layout.batch_count * EF::DIMENSION;
-    debug_assert_eq!(values.len(), layout.batch_count * layout.base_height);
-    debug_assert_eq!(output.len(), width * layout.padded_height);
+    debug_assert_eq!(output.len(), values.len() * EF::DIMENSION);
 
-    output.fill(0);
-    for dst_row in 0..layout.padded_height {
-        let src_row = logical_row_index(dst_row, layout.padded_height, use_natural_order);
-        if src_row >= layout.base_height {
-            continue;
-        }
-
-        let dst_start = dst_row * width;
-        for column in 0..layout.batch_count {
-            let coeffs = unsafe {
-                cast_field_slice::<F, T>(
-                    values[column * layout.base_height + src_row].as_basis_coefficients_slice(),
-                )
-            };
-            let coeff_start = dst_start + column * EF::DIMENSION;
-            for (idx, coeff) in coeffs.iter().enumerate() {
-                output[coeff_start + idx] = coeff.to_unique_u32();
-            }
+    let mut out_idx = 0usize;
+    for value in values {
+        let coeffs = unsafe { cast_field_slice::<F, T>(value.as_basis_coefficients_slice()) };
+        for coeff in coeffs {
+            output[out_idx] = coeff.to_unique_u32();
+            out_idx += 1;
         }
     }
 }
@@ -1336,26 +1460,19 @@ where
 }
 
 #[cfg(target_os = "macos")]
-fn write_supported_prime_field_evals_input<F>(
-    evals: &[F],
-    layout: DftBatchLayout,
-    use_natural_order: bool,
-    buffer: &Buffer,
-) -> bool
+fn write_supported_prime_field_raw_input<F>(evals: &[F], buffer: &Buffer) -> bool
 where
     F: TwoAdicField,
 {
-    let len = layout.batch_count * layout.padded_height;
-    let encoded = unsafe { buffer_u32_slice_mut(buffer, len) };
     if TypeId::of::<F>() == TypeId::of::<BabyBear>() {
         let values = unsafe { cast_field_slice::<F, BabyBear>(evals) };
-        serialize_prime_field_evals_to_words(values, layout, use_natural_order, encoded);
+        unsafe { write_prime_field_raw_input_to_buffer(values, buffer) };
         return true;
     }
 
     if TypeId::of::<F>() == TypeId::of::<KoalaBear>() {
         let values = unsafe { cast_field_slice::<F, KoalaBear>(evals) };
-        serialize_prime_field_evals_to_words(values, layout, use_natural_order, encoded);
+        unsafe { write_prime_field_raw_input_to_buffer(values, buffer) };
         return true;
     }
 
@@ -1363,35 +1480,19 @@ where
 }
 
 #[cfg(target_os = "macos")]
-fn write_supported_extension_field_evals_input<F, EF>(
-    evals: &[EF],
-    layout: DftBatchLayout,
-    use_natural_order: bool,
-    buffer: &Buffer,
-) -> bool
+fn write_supported_extension_field_raw_input<F, EF>(evals: &[EF], buffer: &Buffer) -> bool
 where
     F: TwoAdicField,
     EF: ExtensionField<F>,
 {
-    let width = layout.batch_count * EF::DIMENSION;
-    let encoded = unsafe { buffer_u32_slice_mut(buffer, width * layout.padded_height) };
+    let encoded = unsafe { buffer_u32_slice_mut(buffer, evals.len() * EF::DIMENSION) };
     if TypeId::of::<F>() == TypeId::of::<BabyBear>() {
-        serialize_extension_field_evals_to_words_with_repr::<F, EF, BabyBear>(
-            evals,
-            layout,
-            use_natural_order,
-            encoded,
-        );
+        write_flat_extension_field_raw_input_to_slice_with_repr::<F, EF, BabyBear>(evals, encoded);
         return true;
     }
 
     if TypeId::of::<F>() == TypeId::of::<KoalaBear>() {
-        serialize_extension_field_evals_to_words_with_repr::<F, EF, KoalaBear>(
-            evals,
-            layout,
-            use_natural_order,
-            encoded,
-        );
+        write_flat_extension_field_raw_input_to_slice_with_repr::<F, EF, KoalaBear>(evals, encoded);
         return true;
     }
 
@@ -1688,26 +1789,25 @@ where
     else {
         return run_base_dft_cpu(dft, reshape_transpose_pad(evals, layout));
     };
+    let raw_input_len = evals.len();
 
     match with_metal_executor(|executor| {
-        execute_prime_field_fft(executor, &execution, |input_buffer, use_natural_order| {
-            let wrote_input = write_supported_prime_field_evals_input(
-                evals,
-                layout,
-                use_natural_order,
-                input_buffer,
-            );
-            debug_assert!(
-                wrote_input,
-                "supported field required for Metal input encoding"
-            );
-            if wrote_input {
-                input_buffer.did_modify_range(NSRange::new(
-                    0,
-                    (execution.input_len() * size_of::<u32>()) as u64,
-                ));
-            }
-        })
+        execute_prime_field_fft_from_raw_input(
+            executor,
+            &execution,
+            raw_input_len,
+            layout.base_height,
+            layout.base_height,
+            1,
+            |input_buffer| {
+                let wrote_input = write_supported_prime_field_raw_input(evals, input_buffer);
+                debug_assert!(
+                    wrote_input,
+                    "supported field required for Metal input encoding"
+                );
+                wrote_input
+            },
+        )
     }) {
         Ok(output_buffer) => {
             let Some(values) = decode_prime_field_output(&output_buffer, execution.input_len())
@@ -1743,26 +1843,27 @@ where
             layout.batch_count,
         );
     };
+    let raw_input_len = evals.len() * EF::DIMENSION;
+    let raw_input_width = layout.base_height * EF::DIMENSION;
 
     match with_metal_executor(|executor| {
-        execute_prime_field_fft(executor, &execution, |input_buffer, use_natural_order| {
-            let wrote_input = write_supported_extension_field_evals_input::<F, EF>(
-                evals,
-                layout,
-                use_natural_order,
-                input_buffer,
-            );
-            debug_assert!(
-                wrote_input,
-                "supported field required for Metal input encoding"
-            );
-            if wrote_input {
-                input_buffer.did_modify_range(NSRange::new(
-                    0,
-                    (execution.input_len() * size_of::<u32>()) as u64,
-                ));
-            }
-        })
+        execute_prime_field_fft_from_raw_input(
+            executor,
+            &execution,
+            raw_input_len,
+            raw_input_width,
+            layout.base_height,
+            EF::DIMENSION,
+            |input_buffer| {
+                let wrote_input =
+                    write_supported_extension_field_raw_input::<F, EF>(evals, input_buffer);
+                debug_assert!(
+                    wrote_input,
+                    "supported field required for Metal input encoding"
+                );
+                wrote_input
+            },
+        )
     }) {
         Ok(output_buffer) => {
             let Some(values) = decode_prime_field_output(&output_buffer, execution.input_len())
