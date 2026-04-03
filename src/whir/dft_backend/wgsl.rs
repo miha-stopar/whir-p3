@@ -125,6 +125,15 @@ struct WgslExecutor {
     resources: WgslResourceCache,
 }
 
+#[derive(Debug)]
+pub(super) struct WgslDispatchOnlyBenchmark {
+    execution: WgslPrimeFieldExecution,
+    source_buffer: Arc<wgpu::Buffer>,
+    work_a_buffer: Arc<wgpu::Buffer>,
+    work_b_buffer: Arc<wgpu::Buffer>,
+    twiddle_buffer: Arc<wgpu::Buffer>,
+}
+
 impl WgslPrimeFieldKind {
     #[must_use]
     const fn shader_field_kind(self) -> u32 {
@@ -535,8 +544,8 @@ fn dispatch_prime_field_fft(
     work_a_buffer: &Arc<wgpu::Buffer>,
     work_b_buffer: &Arc<wgpu::Buffer>,
     twiddle_buffer: &Arc<wgpu::Buffer>,
-    staging_buffer: &Arc<wgpu::Buffer>,
-) -> Result<Vec<u32>, WgslError> {
+    staging_buffer: Option<&Arc<wgpu::Buffer>>,
+) -> Result<Option<Vec<u32>>, WgslError> {
     let mut encoder = executor
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -678,9 +687,17 @@ fn dispatch_prime_field_fft(
     }
 
     let output_bytes = (execution.input_len() * size_of::<u32>()) as u64;
-    encoder.copy_buffer_to_buffer(&src_buffer, 0, staging_buffer, 0, output_bytes);
+    if let Some(staging_buffer) = staging_buffer {
+        encoder.copy_buffer_to_buffer(&src_buffer, 0, staging_buffer, 0, output_bytes);
+    }
     executor.queue.submit(Some(encoder.finish()));
 
+    if staging_buffer.is_none() {
+        let _ = executor.device.poll(wgpu::Maintain::wait());
+        return Ok(None);
+    }
+
+    let staging_buffer = staging_buffer.expect("staging buffer checked");
     let buffer_slice = staging_buffer.slice(..output_bytes);
     let (tx, rx) = mpsc::channel();
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -697,7 +714,7 @@ fn dispatch_prime_field_fft(
     let output = words.to_vec();
     drop(data);
     staging_buffer.unmap();
-    Ok(output)
+    Ok(Some(output))
 }
 
 fn execute_prime_field_fft(
@@ -733,8 +750,9 @@ fn execute_prime_field_fft(
         &work_a_buffer,
         &work_b_buffer,
         &twiddle_buffer,
-        &staging_buffer,
+        Some(&staging_buffer),
     )
+    .map(|output| output.expect("readback requested"))
 }
 
 fn try_prepare_prime_field_execution_for_dims<F>(
@@ -1161,6 +1179,64 @@ where
         }
         Err(_) => run_base_dft_cpu(dft, padded),
     }
+}
+
+pub(super) fn prepare_dispatch_only_benchmark<F>(
+    padded: &DenseMatrix<F>,
+) -> Option<WgslDispatchOnlyBenchmark>
+where
+    F: TwoAdicField,
+{
+    let execution = try_prepare_prime_field_execution(padded)?;
+
+    with_wgsl_executor(|executor| {
+        let input_bytes = (execution.input_len() * size_of::<u32>()) as u64;
+        let (source_buffer, work_a_buffer, work_b_buffer, _staging_buffer) = executor
+            .resources
+            .execution_buffers(&executor.device, input_bytes)?;
+        let twiddle_buffer = executor.resources.twiddle_buffer(
+            &executor.device,
+            WgslTwiddleKey {
+                kind: execution.kind,
+                fft_size: execution.fft_size,
+                modulus: execution.modulus,
+            },
+        )?;
+
+        let use_natural_order = execution.prefix_stage_count() > 0;
+        let host_words = executor.resources.host_words_mut(execution.input_len());
+        if !write_supported_prime_field_input(padded, use_natural_order, host_words) {
+            return Err(WgslError::DeviceUnavailable);
+        }
+        executor
+            .queue
+            .write_buffer(&source_buffer, 0, u32_slice_as_bytes(host_words));
+
+        Ok(WgslDispatchOnlyBenchmark {
+            execution,
+            source_buffer,
+            work_a_buffer,
+            work_b_buffer,
+            twiddle_buffer,
+        })
+    })
+    .ok()
+}
+
+pub(super) fn run_dispatch_only_benchmark(benchmark: &WgslDispatchOnlyBenchmark) -> bool {
+    with_wgsl_executor(|executor| {
+        let _ = dispatch_prime_field_fft(
+            executor,
+            &benchmark.execution,
+            &benchmark.source_buffer,
+            &benchmark.work_a_buffer,
+            &benchmark.work_b_buffer,
+            &benchmark.twiddle_buffer,
+            None,
+        )?;
+        Ok(())
+    })
+    .is_ok()
 }
 
 #[inline]

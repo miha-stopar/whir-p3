@@ -378,6 +378,12 @@ pub(super) struct MetalDispatchOnlyBenchmark {
     inner: metal::MetalDispatchOnlyBenchmark,
 }
 
+#[cfg(feature = "gpu-wgsl")]
+#[derive(Debug)]
+pub(super) struct WgslDispatchOnlyBenchmark {
+    inner: wgsl::WgslDispatchOnlyBenchmark,
+}
+
 #[cfg(all(feature = "gpu-metal", target_os = "macos"))]
 pub(super) fn prepare_padded_base_dft_dispatch_only_metal<F>(
     padded: &DenseMatrix<F>,
@@ -393,6 +399,23 @@ pub(super) fn run_padded_base_dft_dispatch_only_metal(
     benchmark: &MetalDispatchOnlyBenchmark,
 ) -> bool {
     metal::run_dispatch_only_benchmark(&benchmark.inner)
+}
+
+#[cfg(feature = "gpu-wgsl")]
+pub(super) fn prepare_padded_base_dft_dispatch_only_wgsl<F>(
+    padded: &DenseMatrix<F>,
+) -> Option<WgslDispatchOnlyBenchmark>
+where
+    F: TwoAdicField,
+{
+    wgsl::prepare_dispatch_only_benchmark(padded).map(|inner| WgslDispatchOnlyBenchmark { inner })
+}
+
+#[cfg(feature = "gpu-wgsl")]
+pub(super) fn run_padded_base_dft_dispatch_only_wgsl(
+    benchmark: &WgslDispatchOnlyBenchmark,
+) -> bool {
+    wgsl::run_dispatch_only_benchmark(&benchmark.inner)
 }
 
 #[cfg(test)]

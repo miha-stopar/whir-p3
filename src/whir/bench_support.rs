@@ -15,6 +15,10 @@ use crate::whir::dft_backend::{
     prepare_padded_base_dft_dispatch_only_metal, run_padded_base_dft_dispatch_only_metal,
 };
 #[cfg(feature = "gpu-wgsl")]
+use crate::whir::dft_backend::{
+    prepare_padded_base_dft_dispatch_only_wgsl, run_padded_base_dft_dispatch_only_wgsl,
+};
+#[cfg(feature = "gpu-wgsl")]
 use crate::whir::dft_backend::{run_padded_base_dft_explicit_wgsl, wgsl_is_available_for_bench};
 
 /// Explicit backend choice for padded base-field DFT microbenchmarks.
@@ -34,6 +38,14 @@ pub enum BaseDftBenchmarkBackend {
 #[derive(Debug)]
 pub struct MetalKernelOnlyBenchmark {
     inner: crate::whir::dft_backend::MetalDispatchOnlyBenchmark,
+}
+
+/// Prepared dispatch-only WGSL benchmark state.
+#[cfg(feature = "gpu-wgsl")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct WgslKernelOnlyBenchmark {
+    inner: crate::whir::dft_backend::WgslDispatchOnlyBenchmark,
 }
 
 /// Return whether a usable Metal runtime is visible to the current process.
@@ -138,4 +150,24 @@ where
 #[doc(hidden)]
 pub fn run_metal_kernel_only_base_dft(benchmark: &MetalKernelOnlyBenchmark) -> bool {
     run_padded_base_dft_dispatch_only_metal(&benchmark.inner)
+}
+
+/// Prepare a dispatch-only WGSL benchmark state with input already uploaded.
+#[cfg(feature = "gpu-wgsl")]
+#[doc(hidden)]
+pub fn prepare_wgsl_kernel_only_base_dft<F>(
+    padded: &DenseMatrix<F>,
+) -> Option<WgslKernelOnlyBenchmark>
+where
+    F: TwoAdicField,
+{
+    prepare_padded_base_dft_dispatch_only_wgsl(padded)
+        .map(|inner| WgslKernelOnlyBenchmark { inner })
+}
+
+/// Run the already-uploaded WGSL DFT benchmark state without host marshaling or readback.
+#[cfg(feature = "gpu-wgsl")]
+#[doc(hidden)]
+pub fn run_wgsl_kernel_only_base_dft(benchmark: &WgslKernelOnlyBenchmark) -> bool {
+    run_padded_base_dft_dispatch_only_wgsl(&benchmark.inner)
 }
