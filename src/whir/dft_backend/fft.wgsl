@@ -2,6 +2,8 @@ const FIELD_KIND_BABY_BEAR: u32 = 0u;
 const FIELD_KIND_KOALA_BEAR: u32 = 1u;
 const BABY_BEAR_MONTY_MU: u32 = 0x88000001u;
 const KOALA_BEAR_MONTY_MU: u32 = 0x81000001u;
+const MAX_DISPATCH_WORKGROUPS_PER_DIM: u32 = 65535u;
+const STAGE_WORKGROUP_SIZE: u32 = 256u;
 
 struct KernelParams {
     word0: u32,
@@ -74,7 +76,7 @@ fn mul_monty(a: u32, b: u32, field_kind: u32, modulus: u32) -> u32 {
 
 @compute @workgroup_size(256)
 fn base_field_dft_stage(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let flat_gid = gid.x;
+    let flat_gid = gid.y * (MAX_DISPATCH_WORKGROUPS_PER_DIM * STAGE_WORKGROUP_SIZE) + gid.x;
     let butterfly_count = u32(arrayLength(&input_data)) / 2u;
     if (flat_gid >= butterfly_count) {
         return;
@@ -114,9 +116,14 @@ fn base_field_dft_prefix(
     let log_fft_size = kernel_params.word2;
     let field_kind = kernel_params.word3;
     let modulus = kernel_params.word4;
+    let total_workgroups = kernel_params.word5;
+    let linear_workgroup = workgroup_id.y * MAX_DISPATCH_WORKGROUPS_PER_DIM + workgroup_id.x;
+    if (linear_workgroup >= total_workgroups) {
+        return;
+    }
     let pair_count = width * (tile_rows >> 1u);
     let is_active = local_tid < pair_count;
-    let global_base_row = workgroup_id.x * tile_rows;
+    let global_base_row = linear_workgroup * tile_rows;
 
     var row_lo: u32 = 0u;
     var row_hi: u32 = 0u;
@@ -186,12 +193,17 @@ fn base_field_dft_stage_pair(
     let field_kind = kernel_params.word4;
     let modulus = kernel_params.word5;
     let twiddle_offset = kernel_params.word6;
+    let total_workgroups = kernel_params.word7;
+    let linear_workgroup = workgroup_id.y * MAX_DISPATCH_WORKGROUPS_PER_DIM + workgroup_id.x;
+    if (linear_workgroup >= total_workgroups) {
+        return;
+    }
 
     let block_rows = half_size << 2u;
     let pair_count = columns_per_group * (block_rows >> 1u);
     let is_active = local_tid < pair_count;
-    let chunk_index = workgroup_id.x % chunk_count;
-    let block_index = workgroup_id.x / chunk_count;
+    let chunk_index = linear_workgroup % chunk_count;
+    let block_index = linear_workgroup / chunk_count;
     let global_base_row = block_index * block_rows;
 
     var local_column: u32 = 0u;

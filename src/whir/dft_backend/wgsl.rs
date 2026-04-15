@@ -22,6 +22,7 @@ use crate::whir::dft_layout::DftBatchLayout;
 const THREADS_PER_WORKGROUP: usize = 256;
 const MAX_FUSED_PREFIX_TILE_ROWS: usize = 64;
 const MAX_WORKGROUP_TILE_ELEMENTS: usize = 1024;
+const MAX_DISPATCH_WORKGROUPS_PER_DIM: usize = 65_535;
 const WGSL_SHADER_SOURCE: &str = include_str!("fft.wgsl");
 
 static WGSL_EXECUTOR: OnceLock<Result<Mutex<WgslExecutor>, WgslError>> = OnceLock::new();
@@ -54,7 +55,7 @@ struct WgslPrefixParams {
     log_fft_size: u32,
     field_kind: u32,
     modulus: u32,
-    _pad0: u32,
+    total_workgroups: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -69,7 +70,7 @@ struct WgslStagePairParams {
     field_kind: u32,
     modulus: u32,
     twiddle_offset: u32,
-    _pad1: u32,
+    total_workgroups: u32,
 }
 
 #[derive(Debug)]
@@ -564,13 +565,14 @@ fn dispatch_prime_field_fft(
 
         if prefix_stage_count > 0 {
             let tile_rows = execution.prefix_tile_rows();
+            let tile_count = execution.fft_size / tile_rows;
             let prefix_params = WgslPrefixParams {
                 width: execution.width as u32,
                 tile_rows: tile_rows as u32,
                 log_fft_size: execution.fft_size.ilog2(),
                 field_kind: execution.field_kind_u32(),
                 modulus: execution.modulus,
-                _pad0: 0,
+                total_workgroups: tile_count as u32,
                 _pad1: 0,
                 _pad2: 0,
             };
@@ -589,7 +591,9 @@ fn dispatch_prime_field_fft(
             );
             compute_pass.set_pipeline(&executor.prefix_pipeline);
             compute_pass.set_bind_group(0, &prefix_bind_group, &[]);
-            compute_pass.dispatch_workgroups((execution.fft_size / tile_rows) as u32, 1, 1);
+            let dispatch_x = tile_count.min(MAX_DISPATCH_WORKGROUPS_PER_DIM) as u32;
+            let dispatch_y = tile_count.div_ceil(MAX_DISPATCH_WORKGROUPS_PER_DIM) as u32;
+            compute_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 
             twiddle_offset = tile_rows - 1;
             src_buffer = dst_buffer;
@@ -610,6 +614,7 @@ fn dispatch_prime_field_fft(
                 let block_rows = half_size << 2;
                 let block_count = execution.fft_size / block_rows;
                 let chunk_count = execution.width.div_ceil(stage_pair_columns_per_group);
+                let total_workgroups = block_count * chunk_count;
                 let stage_pair_params = WgslStagePairParams {
                     width: execution.width as u32,
                     columns_per_group: stage_pair_columns_per_group as u32,
@@ -618,7 +623,7 @@ fn dispatch_prime_field_fft(
                     field_kind: execution.field_kind_u32(),
                     modulus: execution.modulus,
                     twiddle_offset: twiddle_offset as u32,
-                    _pad1: 0,
+                    total_workgroups: total_workgroups as u32,
                 };
                 let stage_pair_params_buffer = executor
                     .resources
@@ -639,7 +644,9 @@ fn dispatch_prime_field_fft(
                 );
                 compute_pass.set_pipeline(&executor.stage_pair_pipeline);
                 compute_pass.set_bind_group(0, &stage_pair_bind_group, &[]);
-                compute_pass.dispatch_workgroups((block_count * chunk_count) as u32, 1, 1);
+                let dispatch_x = total_workgroups.min(MAX_DISPATCH_WORKGROUPS_PER_DIM) as u32;
+                let dispatch_y = total_workgroups.div_ceil(MAX_DISPATCH_WORKGROUPS_PER_DIM) as u32;
+                compute_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 
                 twiddle_offset += half_size + (half_size << 1);
                 stage += 2;
@@ -674,11 +681,10 @@ fn dispatch_prime_field_fft(
             let butterfly_count = execution.width * (execution.fft_size / 2);
             compute_pass.set_pipeline(&executor.stage_pipeline);
             compute_pass.set_bind_group(0, &stage_bind_group, &[]);
-            compute_pass.dispatch_workgroups(
-                butterfly_count.div_ceil(THREADS_PER_WORKGROUP) as u32,
-                1,
-                1,
-            );
+            let butterfly_workgroups = butterfly_count.div_ceil(THREADS_PER_WORKGROUP);
+            let dispatch_x = butterfly_workgroups.min(MAX_DISPATCH_WORKGROUPS_PER_DIM) as u32;
+            let dispatch_y = butterfly_workgroups.div_ceil(MAX_DISPATCH_WORKGROUPS_PER_DIM) as u32;
+            compute_pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 
             twiddle_offset += half_size;
             stage += 1;
